@@ -52,11 +52,19 @@ Gather context for each: `gh issue view <N> --json title,body,labels`.
 
 ### 2. Per-issue worktree workspace + worker agent
 
-**Resolve the namespace once, up front.** All state, the queue, brief/review files,
-the worker registry, and worker display names are namespaced by repo so a *second*
-dual-author run against a different repo can proceed concurrently (even in the same
-herdr session) without colliding on overlapping issue numbers. Everything derives the
-same namespace from the shared git repo, so you never thread it by hand:
+**Resolve the namespace once, up front, then PIN it.** All state, the queue, brief/
+review files, the worker registry, and worker display names are namespaced by repo so a
+*second* dual-author run against a different repo can proceed concurrently (even in the
+same herdr session) without colliding on overlapping issue numbers. The namespace is a
+slug of `gh repo view` — which resolves from the **current pane's cwd**. That is fine
+for workers (they live inside the worktree) but NOT for the dispatcher's dashboard:
+herdr's origin pane (`$HERDR_PANE_ID`) and the dashboard pane split off it can sit in
+`~` or anywhere, where `gh repo view` finds nothing and `ns()` silently falls back to
+`default` — a different namespace from the one the workers registered under, so the
+dashboard reads an empty registry and renames nothing. So resolve `NS` once here (your
+cwd is the repo at this point) and pass `DUAL_AUTHOR_NS=$NS` to EVERY `monitor.py`
+process you launch in another pane — the dashboard especially. Do not rely on cwd
+agreeing across panes:
 
 ```bash
 NS=$(python3 ~/.claude/skills/dual-author/scripts/monitor.py ns)   # slug of owner/repo
@@ -168,7 +176,10 @@ the dashboard lands in the workspace where `/dual-author` was called:
 
 ```bash
 DASH=$(herdr pane split "$HERDR_PANE_ID" --direction down --no-focus | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-herdr pane run "$DASH" "python3 ~/.claude/skills/dual-author/scripts/monitor.py watch"
+# Pin DUAL_AUTHOR_NS — the dashboard pane's cwd may not be the repo, and without
+# this the watcher resolves the wrong namespace, reads an empty registry, and never
+# renames workspaces/agents (the symptom: sidebar stuck at the create-time label).
+herdr pane run "$DASH" "DUAL_AUTHOR_NS=$NS python3 ~/.claude/skills/dual-author/scripts/monitor.py watch"
 ```
 
 Argless watch is **self-updating** — start it ONCE and never restart it. Each tick it

@@ -135,9 +135,14 @@ def _slug(s):
 def ns():
     """Namespace for this run — DUAL_AUTHOR_NS, else a slug of owner/repo.
 
-    Resolved identically in every pane (all share one git repo), so the
-    dispatcher, its workers, and their reviewers land in the same namespace
-    without anyone passing it explicitly."""
+    The owner/repo fallback comes from `gh repo view`, which resolves against the
+    CURRENT PANE'S CWD. Workers run inside the worktree so they resolve correctly,
+    but the dispatcher's dashboard pane may sit outside the repo (in ~ or wherever
+    herdr's origin pane landed), where `gh repo view` finds nothing and this falls
+    back to "default" — a DIFFERENT namespace from the workers', so the dashboard
+    reads an empty registry and renames nothing. Any process launched in a pane
+    that isn't guaranteed to be in the repo (the dashboard above all) MUST be given
+    DUAL_AUTHOR_NS explicitly; do not rely on cwd agreeing across panes."""
     global _NS
     if _NS is None:
         _NS = os.environ.get("DUAL_AUTHOR_NS") or _slug(_repo())
