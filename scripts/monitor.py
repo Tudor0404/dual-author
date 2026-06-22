@@ -61,6 +61,7 @@ Events printed by `wait` (one per line, after a final dashboard render):
 
 --seen takes handled event ids: verdict-<N>, input-<N>, missing-<N>.
 """
+import contextlib
 import json
 import os
 import re
@@ -68,6 +69,11 @@ import shlex
 import subprocess
 import sys
 import time
+
+try:
+    import fcntl  # POSIX file locking (macOS/Linux) — codex auth-spawn serialization
+except ImportError:  # pragma: no cover - non-POSIX; gate degrades to a no-op
+    fcntl = None
 
 BASE_ROOT = "/tmp/dual-author"
 # Everything below is NAMESPACED by repo (see ns()) so two mutually-exclusive
@@ -454,6 +460,36 @@ def _tool_argv(tool):
             "-c", f'sandbox_workspace_write.writable_roots=["{review_root}"]']
 
 
+# Machine-global lock that serializes codex reviewer STARTUP (the auth/token-refresh
+# window) across ALL dual-author runs on this host. codex on ChatGPT-subscription auth
+# authenticates against one shared ~/.codex/auth.json whose refresh token is single-use
+# (rotating): if several reviewers start at once they race the refresh and the losers get
+# 401 "refresh token has already been used" and exit during startup -> the slot reports
+# SPAWN-FAILED (claude reviewers are immune — different credential, no shared rotation).
+# Serializing ONLY the startup window lets each refresh complete + write back before the
+# next codex starts (after the first refresh the token is valid for hours, so the rest
+# read it and start fast); review EXECUTION stays fully parallel. The path is fixed/global
+# (NOT namespaced) because the contended file is shared across every repo/namespace.
+_CODEX_AUTH_LOCK = "/tmp/dual-author-codex-auth.lock"
+
+
+@contextlib.contextmanager
+def _codex_auth_gate(tool):
+    """Hold an exclusive lock around a codex reviewer's startup; no-op otherwise."""
+    if tool != "codex" or fcntl is None:
+        yield
+        return
+    f = open(_CODEX_AUTH_LOCK, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
 def _spawn_reviewer(name, base_pane, split, cwd, tool, prompt):
     """Spawn one reviewer; return its pane_id or None. Verifies a LIVE agent.
 
@@ -462,7 +498,16 @@ def _spawn_reviewer(name, base_pane, split, cwd, tool, prompt):
     a LAUNCH SCRIPT — the pane types only a short script path, so a socket hiccup
     cannot truncate the prompt (typing the long command directly is how rounds
     used to end up as dead half-typed shells).
+
+    codex spawns are serialized through ``_codex_auth_gate`` so concurrent reviewers
+    don't race the single-use refresh token in the shared ~/.codex/auth.json (the
+    SPAWN-FAILED cause); the gate is held only until the agent is alive (auth done).
     """
+    with _codex_auth_gate(tool):
+        return _spawn_reviewer_inner(name, base_pane, split, cwd, tool, prompt)
+
+
+def _spawn_reviewer_inner(name, base_pane, split, cwd, tool, prompt):
     _run("herdr", "agent", "start", name, "--tab", base_pane, "--split", split,
          "--no-focus", "--cwd", cwd, "--", *_tool_argv(tool), prompt)
     for _ in range(6):  # agent start registers the name itself if it worked

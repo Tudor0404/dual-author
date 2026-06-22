@@ -484,6 +484,16 @@ Reviews live in the temp files; your own pane stays for the user.
 
 ## Notes
 
+- **codex reviewer auth serialization.** codex on ChatGPT-subscription auth shares one
+  `~/.codex/auth.json` with a single-use (rotating) refresh token. Concurrent reviewer
+  spawns — multiple workers in one run, or two dual-author runs at once — used to race
+  that refresh; the losers 401 "refresh token has already been used" and exit at startup,
+  so the slot reports `SPAWN-FAILED` (claude reviewers are immune — different credential).
+  `_spawn_reviewer` now holds a machine-global lock (`/tmp/dual-author-codex-auth.lock`)
+  around each codex startup so refreshes serialize and write back before the next codex
+  starts; review execution stays parallel. Deeper escape hatch still works: a
+  `codex-down` sentinel file in the namespace base dir substitutes claude for the codex
+  slot entirely (claude-only rounds).
 - Worker agent names are DISPLAY strings (`⚙️ <ns>-issue-<N> · <phase>`, set by the
   dashboard) — never address a worker by name. Route via the registry: `monitor.py
   register` at dispatch, `monitor.py worker-pane <N>` to resolve its live pane. Reviewers
