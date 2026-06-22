@@ -23,6 +23,15 @@ targets, state waits, reads by name. Use `herdr pane ...` only for plain termina
 
 ## DISPATCHER role
 
+**Anchor every dispatcher-owned pane to `$HERDR_PANE_ID`.** The dashboard (and any pane
+you split for yourself) must land in the pane `/dual-author` was invoked in, NOT the
+focused pane. herdr's "the focused pane is yours" rule is WRONG here: the user navigates
+away while the pipeline runs, so the focused pane drifts to a worker/other workspace and
+splits would land there. `$HERDR_PANE_ID` identifies your pane regardless of focus, and
+it's inherited **env** — present in every Bash call you make (a captured shell var would
+NOT survive across calls), so just reference `$HERDR_PANE_ID` directly. Never resolve
+"your pane" via `pane list`/focus.
+
 ### 1. Resolve work items
 
 Args can be any of:
@@ -42,6 +51,23 @@ see the blast radius first.
 Gather context for each: `gh issue view <N> --json title,body,labels`.
 
 ### 2. Per-issue worktree workspace + worker agent
+
+**Resolve the namespace once, up front.** All state, the queue, brief/review files,
+the worker registry, and worker display names are namespaced by repo so a *second*
+dual-author run against a different repo can proceed concurrently (even in the same
+herdr session) without colliding on overlapping issue numbers. Everything derives the
+same namespace from the shared git repo, so you never thread it by hand:
+
+```bash
+NS=$(python3 ~/.claude/skills/dual-author/scripts/monitor.py ns)   # slug of owner/repo
+BASE="/tmp/dual-author/$NS"; mkdir -p "$BASE"
+```
+
+Use `$BASE/...` for every temp path. The worker's **display** name is
+`⚙️ $NS-issue-$N · <phase>` (set by the dashboard), but you never route by it — you
+`register` each worker and resolve it later via `monitor.py worker-pane $N` (see below).
+(To run two namespaces for the *same* repo, export `DUAL_AUTHOR_NS` before launching and
+pass it to workers — not needed for distinct repos.)
 
 For each issue `N`, one command creates the worktree (at
 `~/.herdr/worktrees/<repo>/<branch>`), a new workspace, and its root pane:
@@ -69,15 +95,21 @@ grep -qF "[projects.\"$WT_PATH\"]" ~/.codex/config.toml 2>/dev/null \
 ```
 
 Start the worker **in the workspace's existing root pane** (do NOT `agent start
---workspace` — that adds a second pane and leaves the root shell orphaned), then name
-it as an agent target. Write the issue brief to a FILE and pass a SHORT prompt that
-references it — long inline prompts get silently truncated mid-typing by `pane run`:
+--workspace` — that adds a second pane and leaves the root shell orphaned). Write the
+issue brief to a FILE and pass a SHORT prompt that references it — long inline prompts
+get silently truncated mid-typing by `pane run`:
 
 ```bash
-BRIEF="/tmp/dual-author/issue-$N-brief.txt"; mkdir -p /tmp/dual-author
+BRIEF="$BASE/issue-$N-brief.txt"
 printf '%s\n\n%s\n' "<title>" "<full issue body / context>" > "$BRIEF"
-herdr pane run "$ROOT_PANE" "claude --model opus --effort high 'Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER role exactly. Your agent name is issue-$N. You are in a git worktree on branch issue/$N for GitHub issue #$N. Read $BRIEF for the full issue brief. Base branch: main.'"
-sleep 3 && herdr agent rename "$ROOT_PANE" "issue-$N"   # retry once if detection lags
+herdr pane run "$ROOT_PANE" "claude --model opus --effort high 'Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER role exactly. You are in a git worktree on branch issue/$N for GitHub issue #$N. Read $BRIEF for the full issue brief. Base branch: main.'"
+# Register the worker against STABLE handles (terminal id + workspace), then give it an
+# initial display name. Routing now goes through the registry, NOT the agent name — the
+# dashboard renames the agent to "⚙️ $NS-issue-$N · <phase>" each tick, so the name is
+# display-only. Resolve the worker later with `monitor.py worker-pane $N`, never by name.
+sleep 3
+python3 ~/.claude/skills/dual-author/scripts/monitor.py register "$N" --workspace "$WS" --pane "$ROOT_PANE"
+herdr agent rename "$ROOT_PANE" "⚙️ $NS-issue-$N · starting"   # retry once if detection lags
 # A fresh worktree can stack TWO claude startup dialogs (the security notice, then
 # the "new MCP servers found" picker) and the worker sits silently at them looking
 # alive but doing nothing. Send Enter 3x, spaced, to clear both regardless of
@@ -115,14 +147,14 @@ overrides. Spawn up to the cap, queue the rest; when a worker prints its verdict
 dispatch the next queued issue (create its worktree lazily, at dispatch time).
 
 **Queue file**: the dashboard reads the pending queue live from
-`/tmp/dual-author/queue.txt` (one issue number per line, dispatch order). Write it
+`$BASE/queue.txt` (one issue number per line, dispatch order). Write it
 right after resolving the work list, and rewrite it every time you dispatch a queued
 issue:
 
 ```bash
-mkdir -p /tmp/dual-author && printf '%s\n' 854 855 > /tmp/dual-author/queue.txt
+printf '%s\n' 854 855 > "$BASE/queue.txt"
 # when dispatching 854:
-grep -vx 854 /tmp/dual-author/queue.txt > /tmp/dual-author/queue.txt.new && mv /tmp/dual-author/queue.txt.new /tmp/dual-author/queue.txt
+grep -vx 854 "$BASE/queue.txt" > "$BASE/queue.txt.new" && mv "$BASE/queue.txt.new" "$BASE/queue.txt"
 ```
 
 ### 3. Monitoring — shell script, NOT self-re-prompting
@@ -131,19 +163,20 @@ Do NOT poll by repeatedly running herdr commands yourself — that burns tokens 
 floods the transcript. All polling lives in `~/.claude/skills/dual-author/scripts/monitor.py`.
 
 **Live dashboard pane** (pure shell loop, zero LLM involvement): split a small pane off
-your own and run watch mode in it:
+`$HERDR_PANE_ID` (your origin pane — NOT the focused pane) and run watch mode in it, so
+the dashboard lands in the workspace where `/dual-author` was called:
 
 ```bash
-DASH=$(herdr pane split <your pane id> --direction down --no-focus | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+DASH=$(herdr pane split "$HERDR_PANE_ID" --direction down --no-focus | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
 herdr pane run "$DASH" "python3 ~/.claude/skills/dual-author/scripts/monitor.py watch"
 ```
 
 Argless watch is **self-updating** — start it ONCE and never restart it. Each tick it
-auto-discovers active workers (agents named `issue-<N>`) and reads the pending queue
-from `/tmp/dual-author/queue.txt`: newly dispatched issues appear on their own,
-merged/recycled ones drop off, queued issues show as ⏳ rows with the next-up one
-marked `◀ next`. It also shows per-issue elapsed time (total + time in current phase),
-persisted in `/tmp/dual-author/monitor-state.json` so even a dashboard restart doesn't
+auto-discovers active workers (agents named `$NS-issue-<N>`, scoped to this repo's
+namespace) and reads the pending queue from `$BASE/queue.txt`: newly dispatched issues
+appear on their own, merged/recycled ones drop off, queued issues show as ⏳ rows with
+the next-up one marked `◀ next`. It also shows per-issue elapsed time (total + time in
+current phase), persisted in `$BASE/monitor-state.json` so even a dashboard restart doesn't
 reset the clocks. Your only duty is keeping `queue.txt` current (step 2).
 
 Watch mode also live-renames each issue's workspace label to its stage
@@ -161,31 +194,33 @@ python3 ~/.claude/skills/dual-author/scripts/monitor.py wait --seen "$SEEN" 851 
   a `phase: done` marker, **or the PR-merge ground truth** (the monitor polls
   `gh pr list --head issue/N --state merged` every 60s — pane text alone is lossy:
   verdict blocks scroll out of the read window, sessions pause at usage limits, and
-  TUI redraws eat lines). Read the verdict block (`herdr agent read issue-N --source
-  recent-unwrapped --lines 120`); if it already scrolled away, get the facts from
-  `gh pr view` instead — a merged PR is a finished issue regardless of pane state.
-  Record it, add `verdict-N` to `$SEEN`. Sweep any reviewer panes the worker left
-  open (it should have closed them, but enforce it):
+  TUI redraws eat lines). Read the verdict block (`herdr agent read "$(python3
+  ~/.claude/skills/dual-author/scripts/monitor.py worker-pane N)" --source
+  recent-unwrapped --lines 120` — the worker's agent name now carries icon+phase and
+  isn't addressable, so resolve its pane id); if it already scrolled away, get the facts
+  from `gh pr view` instead — a merged PR is a finished issue regardless of pane state.
+  Record it, add `verdict-N` to `$SEEN`. Sweep any reviewer panes the worker left open
+  (it should have closed them, but enforce it — closes every non-worker pane in the
+  issue's workspace):
 
   ```bash
-  herdr agent list | python3 -c 'import sys,json
-  for a in json.load(sys.stdin)["result"]["agents"]:
-      n = a.get("name") or ""
-      if n.startswith("issue-<N>-codex-") or n.startswith("issue-<N>-claude-"):
-          print(a["pane_id"])' | xargs -n1 herdr pane close 2>/dev/null
+  python3 ~/.claude/skills/dual-author/scripts/monitor.py close-reviewers N
   ```
 
   Then:
-  - **merged** → the tab has served its purpose: remove it so a new issue takes its
-    place — `herdr worktree remove --workspace <ws_id> --force` (removes workspace +
-    checkout), then `git -C <repo> branch -D issue/N 2>/dev/null` (remote branch was
-    deleted by `--delete-branch`). The dashboard drops the row on its own once the
-    agent is gone — no restart needed.
+  - **merged** → the tab has served its purpose: drop it from the registry then remove
+    it so a new issue takes its place — `python3
+    ~/.claude/skills/dual-author/scripts/monitor.py unregister N`, then `herdr worktree
+    remove --workspace <ws_id> --force` (removes workspace + checkout), then `git -C
+    <repo> branch -D issue/N 2>/dev/null` (remote branch was deleted by
+    `--delete-branch`). The dashboard drops the row as soon as it's unregistered — no
+    restart needed.
   - **draft / auto-merge armed** (something failed or checks still pending) → leave the
-    workspace open for inspection.
+    workspace open for inspection (and registered, so it keeps showing on the dashboard).
   - Either way, dispatch the next queued issue if any.
-- `EVENT needs-input <N>` → read the worker's `=== NEEDS INPUT ===` block and print
-  the **TL;DR right here** plus `herdr agent focus issue-N` to jump there. The user
+- `EVENT needs-input <N>` → read the worker's `=== NEEDS INPUT ===` block and print the
+  **TL;DR right here** plus `herdr agent focus "$(python3
+  ~/.claude/skills/dual-author/scripts/monitor.py worker-pane N)"` to jump there. The user
   should be able to decide from your pane alone. No NEEDS INPUT block → likely a
   permission prompt; say so. Add `input-N` to `$SEEN` (re-add as unseen if it blocks
   again later by removing it once the worker resumes working).
@@ -211,7 +246,18 @@ their cleanup commands (`herdr worktree remove --workspace <id>`), never auto-ru
 ## WORKER role
 
 You own one issue, one worktree (your cwd), one workspace. Base branch is `main`. Your
-agent name was given in your launch prompt (`issue-<N>`).
+issue number `<N>` was given in your launch prompt. (Your agent's display name is set by
+the dashboard to `⚙️ <ns>-issue-<N> · <phase>` and changes as you progress — it's
+cosmetic; you never address yourself by it.) Resolve your namespace and temp base once
+(same repo → same `<ns>` the dispatcher used):
+
+```bash
+NS=$(python3 ~/.claude/skills/dual-author/scripts/monitor.py ns)
+BASE="/tmp/dual-author/$NS"; mkdir -p "$BASE"
+```
+
+Use `$BASE/...` for every temp path below. The review runner auto-namespaces its own
+output dirs and reviewer agent names, so `monitor.py review <N> ...` needs no ns flag.
 
 **Phase markers**: the dispatcher reads your pane to drive a live dashboard. At every
 transition, `echo "[dual-author] phase: <phase> ::"` — the trailing ` ::` sentinel lets
@@ -277,7 +323,7 @@ Write your review prompt to a file (it must NOT contain the "write your review t
 …/VERDICT" instruction — the runner appends that itself):
 
 ```bash
-RD=/tmp/dual-author/issue-<N>; mkdir -p "$RD"
+RD="$BASE/issue-<N>"; mkdir -p "$RD"
 cat > "$RD/r<k>-prompt.txt" <<'PROMPT'
 Review the diff of this branch against main (git diff main...HEAD) for correctness
 bugs, security issues, and missed requirements of issue #<N>: <title>. Be specific,
@@ -289,17 +335,27 @@ python3 ~/.claude/skills/dual-author/scripts/monitor.py review <N> r<k> \
 ```
 
 The runner blocks for the whole round (run it with a generous Bash timeout) and
-prints JSON: `{"codex": {"file": ..., "verdict": "PASS|FAIL|MISSING|SPAWN-FAILED"},
-"claude": {...}}`. Exit 0 = both verdicts in. It spawns the reviewers split off
-YOUR pane (resolved by your agent name — never the focused pane), passes the prompt
-as a single argv element (immune to typing truncation), retries a failed spawn once,
-re-prompts once if a reviewer idles without writing its VERDICT, and closes both
-panes in a `finally` — no orphans even on crash/timeout.
+prints JSON: `{"codex": {"file": ..., "verdict": "PASS|FAIL|CANCELLED|MISSING|SPAWN-FAILED"},
+"claude": {...}}`. Exit 0 = the round was decided (every slot is PASS, FAIL, or
+CANCELLED). It spawns the reviewers split off YOUR pane (it runs in your pane, so it
+anchors on `$HERDR_PANE_ID` — never the focused pane), passes the prompt as a single argv
+element (immune to typing truncation), retries a failed spawn once, re-prompts once if a
+reviewer idles without writing its VERDICT, and closes both panes in a `finally` — no
+orphans even on crash/timeout.
 
-Then read the FULL reviews from the two file paths in the JSON (the Read tool — not
-pane scrollback). `MISSING`/`SPAWN-FAILED` after the runner's own retries is a real
-failure: re-run the round once with a fresh tag (`r<k>b`); if it fails again,
-escalate (step 0).
+**Fail-fast short-circuit.** The two reviewers run concurrently and the runner polls
+both. The **first** reviewer to return `VERDICT: FAIL` ends the round immediately: the
+other reviewer is **cancelled** (its pane closed) and reported as `CANCELLED`. You do
+NOT wait for a second opinion on a round that already failed — read the failing
+reviewer's review file and go straight to fixing (step 3). A `CANCELLED` slot is
+expected and fine; it is not an error and needs no re-run. Both reviewers only run to
+completion when neither fails.
+
+Then read the FULL review(s) from the file path(s) in the JSON (the Read tool — not
+pane scrollback): on a FAIL short-circuit, read the failing slot's file (the
+`CANCELLED` slot has no usable verdict); otherwise read both. `MISSING`/`SPAWN-FAILED`
+after the runner's own retries is a real failure: re-run the round once with a fresh tag
+(`r<k>b`); if it fails again, escalate (step 0).
 
 For PHASED issues, tag rounds `p<phase>-r<k>` (e.g. `p2-r6`) — the tag is the file
 prefix and the agent-name suffix; any single hyphenated token works.
@@ -355,15 +411,15 @@ criterion to the test/check that proves it, flagging any caveats. The boxes must
 what is actually proven, not just "Closes #N" — a closed issue is the durable record.
 
 ```bash
-gh issue view "$N" --json body --jq .body > /tmp/dual-author/issue-$N-body.md
+gh issue view "$N" --json body --jq .body > "$BASE/issue-$N-body.md"
 # Tick ONLY the genuinely-proven criteria — edit the file by hand; do NOT blanket-tick.
 # Leave deferred/uncovered boxes unchecked and note them in the comment.
-gh issue edit "$N" --body-file /tmp/dual-author/issue-$N-body.md
+gh issue edit "$N" --body-file "$BASE/issue-$N-body.md"
 # AC -> evidence table: one row per criterion (test name + CI job), with a Caveats section
 # for anything deferred or not CI-executed.
 printf '## Acceptance criteria — evidence\n\n| Criterion | Proving test | CI job |\n|---|---|---|\n%s\n\n**Caveats:** %s\n' \
-  "<rows>" "<deferred / not-yet-CI-executed items, or 'none'>" > /tmp/dual-author/issue-$N-accomment.md
-gh issue comment "$N" --body-file /tmp/dual-author/issue-$N-accomment.md
+  "<rows>" "<deferred / not-yet-CI-executed items, or 'none'>" > "$BASE/issue-$N-accomment.md"
+gh issue comment "$N" --body-file "$BASE/issue-$N-accomment.md"
 ```
 
 Then mark the PR ready and enable auto-merge so it merges only once ALL checks pass —
@@ -401,26 +457,41 @@ codex: PASS|FAIL — <one line>
 claude: PASS|FAIL — <one line>
 bots: <n> comments, <addressed/skipped summary>; checks: PASS|FAIL
 acceptance: <n>/<m> criteria ticked (deferred: <list or none>); mapping comment posted
-reviews: /tmp/dual-author/issue-<N>/ (full text, all rounds)
+reviews: /tmp/dual-author/<ns>/issue-<N>/ (full text, all rounds)
 files: <changed file list>
 notes: <skipped false positives, open questions>
 ```
 
 **Before printing the verdict block**, verify no reviewer pane of yours outlived its
-round (the review runner closes them; the dispatcher's watch reaps stragglers): if
-`herdr agent list` still shows agents in your workspace other than yourself, close
-them. Then print the block, `echo "[dual-author] phase: done"`, and stop. Reviews
-live in the temp files; your own pane stays for the user.
+round (the review runner closes them; the dispatcher's watch reaps stragglers): close
+every pane in your workspace except your own (`$HERDR_PANE_ID`) —
+`python3 ~/.claude/skills/dual-author/scripts/monitor.py close-reviewers <N>` does
+exactly this. Then print the block, `echo "[dual-author] phase: done"`, and stop.
+Reviews live in the temp files; your own pane stays for the user.
 
 ---
 
 ## Notes
 
-- Agent names are session-unique handles — always prefix with the issue number.
+- Worker agent names are DISPLAY strings (`⚙️ <ns>-issue-<N> · <phase>`, set by the
+  dashboard) — never address a worker by name. Route via the registry: `monitor.py
+  register` at dispatch, `monitor.py worker-pane <N>` to resolve its live pane. Reviewers
+  keep stable per-round spawn names (the runner owns them); they're swept structurally
+  (any non-worker pane in the issue's workspace), so their names don't matter for routing.
 - Worktrees live at `~/.herdr/worktrees/<repo>/issue-<N>`; `herdr worktree remove
   --workspace <id>` cleans up both workspace and checkout (dispatcher offers, never auto-runs).
 - `herdr integration install claude` / `codex` improves state detection and session
   identity — suggest once if waits behave oddly, don't auto-install.
 - herdr ids compact when things close — parse ids from command output, never reuse
-  stale ones; prefer agent names over pane ids everywhere.
+  stale ones. Worker pane ids can change as reviewer splits open/close, so always
+  re-resolve with `monitor.py worker-pane <N>` (registry → stable terminal id) rather
+  than caching a pane id.
 - Parallelism: all workers run concurrently; each workspace is independent.
+- Concurrent repos: a second `/dual-author` run against a *different* repo is safe to
+  run at the same time — even in the same herdr session. State, queue, brief/review
+  files, the registry (`/tmp/dual-author/<ns>/`) and worker display names
+  (`<ns>-issue-<N>`) are namespaced by repo, and each run gets its own dashboard pane
+  (anchored to its `$HERDR_PANE_ID`) that only sees its own namespace. The
+  namespace is auto-derived (`monitor.py ns`), so nothing has to be coordinated between
+  the two runs. (Two namespaces for the *same* repo needs `DUAL_AUTHOR_NS` exported and
+  passed to workers.)
