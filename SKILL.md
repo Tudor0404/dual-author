@@ -389,7 +389,7 @@ they go into the same triage. Check once after spawning reviewers, then while bl
 on `agent wait` cycles; after your final push, do one last sweep with a grace window
 (~3 min — `sleep 60` between up to 3 checks) so slow bots get a chance to land.
 
-### 3. Fix and re-review with FRESH reviewers (max 3 rounds)
+### 3. Fix and re-review with FRESH reviewers (loop until clean)
 
 Triage the combined findings — local reviewers + PR bot comments + failing checks.
 Fix real issues, skip false positives (note why; reply to the bot comment via
@@ -404,8 +404,8 @@ Run the round-k review with the SAME state-machine command as step 2 — a new t
 (`r<k>`), same prompt file content, full diff (`git diff main...HEAD`), no mention of
 previous rounds, no summary of what you fixed: they must find problems independently.
 The runner handles spawn/wait/collect/close — there is no manual sweep step anymore.
-Stop when both fresh reviewers pass, remaining findings are only false positives, or
-you hit 3 rounds.
+Stop when both fresh reviewers pass or remaining findings are only false positives.
+There is no round cap — keep looping until the diff is genuinely clean.
 
 ### 4. Report
 
@@ -449,7 +449,7 @@ running at the deadline, report `auto-merge armed` instead and stop.
 If the repo doesn't allow auto-merge (`gh pr merge --auto` fails), verify checks
 directly instead: `gh pr checks "$PR" --watch` and merge with `gh pr merge "$PR"
 --squash` only when every check is green; if checks fail, treat it as a new finding
-(fix → push → re-check, within your round budget). If anything still fails at the end,
+(fix → push → re-check, looping until clean). If anything still fails at the end,
 leave the PR draft and unmerged.
 
 **Re-review invariant — no commit reaches the merge gate unreviewed.** ANY commit made
@@ -491,9 +491,16 @@ Reviews live in the temp files; your own pane stays for the user.
   so the slot reports `SPAWN-FAILED` (claude reviewers are immune — different credential).
   `_spawn_reviewer` now holds a machine-global lock (`/tmp/dual-author-codex-auth.lock`)
   around each codex startup so refreshes serialize and write back before the next codex
-  starts; review execution stays parallel. Deeper escape hatch still works: a
-  `codex-down` sentinel file in the namespace base dir substitutes claude for the codex
-  slot entirely (claude-only rounds).
+  starts; review execution stays parallel. The runner self-heals: if a codex reviewer
+  still can't start after its retries, the round substitutes a fresh claude into the
+  codex slot for THAT round only (decided dual-reviewer round, not an undecided
+  SPAWN-FAILED slot), and codex is attempted from scratch next round — so it resumes
+  automatically the moment codex recovers, with no manual cleanup. Optional manual
+  skip: a `codex-down` sentinel file in the namespace base dir forces the claude
+  substitution up front (skips the wasted codex spawn attempt while codex is known
+  dead). That flag SELF-EXPIRES after 90 min — drop it to skip codex now, but it can't
+  silently pin every round to dual-claude forever the way the old never-cleared sentinel
+  did. `touch <base>/codex-down` to refresh the window; `rm` it to resume codex sooner.
 - Worker agent names are DISPLAY strings (`⚙️ <ns>-issue-<N> · <phase>`, set by the
   dashboard) — never address a worker by name. Route via the registry: `monitor.py
   register` at dispatch, `monitor.py worker-pane <N>` to resolve its live pane. Reviewers

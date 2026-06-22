@@ -87,6 +87,10 @@ BASE_ROOT = "/tmp/dual-author"
 # Grace must outlive the worker's wait→read-file cycle (seconds), not the review itself.
 REVIEWER_IDLE_SWEEP_SECS = 180
 REVIEWER_UNKNOWN_SWEEP_SECS = 600  # crashed/undetected: keep a forensics window, then reap
+# codex-down sentinel self-expiry: a manually-dropped codex-down flag is honored
+# only while fresh, then auto-removed so a forgotten flag can't silently pin every
+# round to dual-claude forever (it used to have NO removal path at all).
+CODEX_DOWN_TTL_SECS = 90 * 60
 
 # capture ACROSS newlines: the TUI hard-wraps lines mid-word, so grab a window
 # after "phase:", strip whitespace, then match against the known phase vocabulary.
@@ -569,11 +573,23 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
     with open(sentinel, "w") as f:
         f.write(str(os.getpid()))
     plan = {}
-    # <base>/codex-down sentinel (dispatcher-managed): codex CLI is
-    # quota-dead at OpenAI. Fill the codex SLOT with a second independent claude
-    # instance so every round still gets two reviewers. The result key stays
-    # "codex" (callers read it structurally); "tool" records the substitution.
-    codex_down = os.path.exists(os.path.join(base(), "codex-down"))
+    # <base>/codex-down sentinel (manual skip): an operator drops this when codex is
+    # quota-dead at OpenAI so rounds don't waste a spawn attempt on it — the codex
+    # SLOT is filled with a second independent claude instead, so every round still
+    # gets two reviewers. The result key stays "codex" (callers read it structurally);
+    # "tool" records the substitution. The flag SELF-EXPIRES after CODEX_DOWN_TTL_SECS
+    # so a forgotten sentinel can't silently pin every round to dual-claude forever;
+    # once expired we delete it and attempt codex again (the spawn-failure fallback
+    # below still covers the case where codex is genuinely still down).
+    cd_path = os.path.join(base(), "codex-down")
+    codex_down = False
+    try:
+        if time.time() - os.path.getmtime(cd_path) < CODEX_DOWN_TTL_SECS:
+            codex_down = True
+        else:
+            os.remove(cd_path)  # stale flag — let codex be retried
+    except OSError:
+        pass  # no sentinel (or it vanished) → attempt codex normally
     for slot, split in (("codex", "right"), ("claude", "down")):
         tool, name, outfile = slot, f"{worker}-{slot}-{tag}", f"{rd}/{tag}-{slot}.md"
         if slot == "codex" and codex_down:
@@ -589,6 +605,20 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
         for slot, p in plan.items():  # SPAWN + VERIFY (one retry)
             p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"])
                          or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"]))
+            # Self-healing codex fallback: if the codex reviewer can't start (quota
+            # dead, or it lost the auth-lock race after both retries) substitute a
+            # fresh claude into the slot for THIS round, so we still get two reviewers
+            # and a DECIDED round instead of an undecided SPAWN-FAILED slot. No
+            # sentinel needed — codex is attempted from scratch next round, so the
+            # moment it recovers it's used again automatically.
+            if p["pane"] is None and p["tool"] == "codex":
+                p["tool"] = "claude"
+                p["name"] = f"{worker}-claude-{tag}x"   # still matches the sweep regex
+                p["file"] = f"{rd}/{tag}-claude2.md"
+                p["prompt"] = (f"{prompt} Write your FULL review to {p['file']}, ending the file "
+                               f"with VERDICT: PASS or VERDICT: FAIL on its own line.")
+                p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"])
+                             or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"]))
         # COLLECT helper: read a finished reviewer's verdict, re-prompt once if absent.
         def _collect(p):
             v = _verdict_of(p["file"])

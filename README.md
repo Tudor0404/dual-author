@@ -7,7 +7,7 @@ Point it at one or more GitHub issues (or a project board, label, or milestone) 
 1. **Create** a dedicated git worktree workspace.
 2. **Implement** the issue with a named Claude worker agent and push a **draft PR**.
 3. **Dual-review** the change with fresh `codex` + `claude` reviewer agents in split panes, plus PR review bots (CodeRabbit, Copilot, CI).
-4. **Fix → re-review** with fresh reviewer instances each round until the diff is clean (max 3 rounds).
+4. **Fix → re-review** with fresh reviewer instances each round until the diff is clean (no round cap).
 5. **Mark the PR ready** and arm auto-merge — it merges only when all checks pass.
 
 A live dashboard pane shows per-issue stage, elapsed time, and a final verdict summary.
