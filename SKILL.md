@@ -130,21 +130,38 @@ for _ in 1 2 3; do sleep 6; herdr pane send-keys "$ROOT_PANE" Enter 2>/dev/null;
 Keep the prompt shell-safe (no unescaped quotes).
 
 **Mark the issue in-progress immediately after dispatch** (every issue, including
-queued ones when their turn comes) so the board reflects pickup in real time:
+queued ones when their turn comes) so the board reflects pickup in real time. Set
+BOTH signals — the label is the universal heartbeat (works for any issue, no board
+needed); the board Status move is what shows up on a project board's columns:
 
 ```bash
 gh label create in-progress --color FBCA04 --description "dual-author agent working on it" 2>/dev/null || true
 gh issue edit "$N" --add-label in-progress
 ```
 
-If the work items came from a **project board**, also move the item's Status to
-"In Progress" — resolve the field/option ids once up front, reuse for every dispatch:
+Then move every project board this issue sits on to Status = "In Progress". This is
+NOT conditional on the run being `board`-sourced — discover the issue's project items
+at dispatch so label/search/milestone/issue-number runs update the board too. One
+GraphQL call resolves the item, project, Status-field, and "In Progress" option ids
+per board (an issue can be on several); set `OWNER`/`REPO` once:
 
 ```bash
-gh project field-list <number> --owner <owner> --format json   # → Status field id + "In Progress" option id
-gh project item-edit --id <item-id> --project-id <project-id> \
-  --field-id <status-field-id> --single-select-option-id <in-progress-option-id>
+OWNER=<owner>; REPO=<repo>
+gh api graphql -f owner="$OWNER" -f repo="$REPO" -F num="$N" -f query='
+  query($owner:String!,$repo:String!,$num:Int!){
+    repository(owner:$owner,name:$repo){ issue(number:$num){ projectItems(first:20){ nodes{
+      id
+      project{ id field(name:"Status"){ ... on ProjectV2SingleSelectField { id options{ id name } } } }
+    }}}}}' --jq '
+    .data.repository.issue.projectItems.nodes[] | . as $i
+    | ($i.project.field.options[]? | select(.name|test("In Progress";"i")) | .id) as $opt
+    | select($opt != null) | [$i.id, $i.project.id, $i.project.field.id, $opt] | @tsv' \
+| while IFS=$'\t' read -r ITEM PROJ FIELD OPT; do
+    gh project item-edit --id "$ITEM" --project-id "$PROJ" --field-id "$FIELD" --single-select-option-id "$OPT"
+  done
 ```
+
+(If the issue is on no board the loop runs zero times — the label alone covers it.)
 
 (No cleanup step needed: the merge closes the issue via `Closes #N`, and board
 automations move closed issues to Done. For PRs that end draft/unmerged, the label
