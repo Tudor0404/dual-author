@@ -340,6 +340,13 @@ The PR exists from the start so review bots (CodeRabbit, Copilot, CI annotators)
 working in parallel with your local reviewers. Record the push timestamp — you'll only
 act on comments newer than your latest push.
 
+**Tests gate every review round.** Before spawning reviewers, run the relevant unit and
+integration tests — the suites covering the packages/modules your diff touches, not the
+full suite (CI is the full-suite backstop via the auto-merge gate). If anything fails,
+fix it and re-run before proceeding: a reviewer round spent on a diff that fails its own
+tests is a wasted round, and the Report phase needs passing tests as acceptance-criteria
+evidence anyway. Run them in a plain `herdr pane` terminal if long-running.
+
 ### 2. Run a dual-review round (state machine — do NOT hand-roll panes)
 
 The entire reviewer lifecycle (spawn → verify registration → name → wait → collect
@@ -417,7 +424,9 @@ Then re-review with **fresh reviewer instances, not the same sessions** — a re
 that already passed your code is anchored on its own findings and is the wrong gate
 for NEW bugs your fixes introduced. Each round reviews the full current diff cold:
 
-Run the round-k review with the SAME state-machine command as step 2 — a new tag
+Re-run the relevant unit and integration tests first — fixes break tests as easily as
+the original implementation did; don't spawn a round on a diff that fails its own tests.
+Then run the round-k review with the SAME state-machine command as step 2 — a new tag
 (`r<k>`), same prompt file content, full diff (`git diff main...HEAD`), no mention of
 previous rounds, no summary of what you fixed: they must find problems independently.
 The runner handles spawn/wait/collect/close — there is no manual sweep step anymore.
