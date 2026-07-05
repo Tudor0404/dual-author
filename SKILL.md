@@ -77,6 +77,23 @@ Use `$BASE/...` for every temp path. The worker's **display** name is
 (To run two namespaces for the *same* repo, export `DUAL_AUTHOR_NS` before launching and
 pass it to workers — not needed for distinct repos.)
 
+**Sync `main` to `origin/main` ONCE, before the dispatch loop.** `herdr worktree create
+--base main` branches off your **local** `main` ref — it does NOT fetch. If local `main`
+is behind the remote, every worktree it cuts starts stale (drives the stale-diff and
+migration-collision failure modes). Fast-forward local `main` from the primary worktree
+first (`--ff-only` so a diverged/dirty `main` fails loudly instead of creating a merge
+commit — resolve by hand if it does):
+
+```bash
+git -C "$(git rev-parse --show-toplevel)" fetch origin main
+git -C "$(git rev-parse --show-toplevel)" merge --ff-only origin/main \
+  || { echo "local main diverged from origin/main — reconcile before dispatching"; exit 1; }
+```
+
+If `main` isn't the currently checked-out branch in the primary worktree, fetch still
+advances the remote-tracking ref; use `git branch -f main origin/main` (only when `main`
+is not checked out anywhere) instead of the `merge --ff-only` above.
+
 For each issue `N`, one command creates the worktree (at
 `~/.herdr/worktrees/<repo>/<branch>`), a new workspace, and its root pane:
 
