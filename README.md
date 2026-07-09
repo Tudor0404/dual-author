@@ -10,7 +10,7 @@ Point it at one or more GitHub issues (or a project board, label, or milestone) 
 4. **Fix → re-review** with fresh reviewer instances each round until the diff is clean (no round cap).
 5. **Mark the PR ready** and arm auto-merge — it merges only when all checks pass.
 
-A live dashboard pane shows per-issue stage, elapsed time, and a final verdict summary.
+A live dashboard pane runs a full-screen [Textual](https://textual.textualize.io/) TUI: a selectable issues table (stage, timings, PR, checks), a per-issue detail panel (review-round verdicts, live worker output), an activity feed, and a `g` graph view: the blocking DAG between the run's issues (from GitHub issue dependencies) plus every issue's pipeline chain at once. It also live-renames each issue's workspace, agent, and tab (`#<N> · <repo>`) so the whole herdr UI doubles as a status board. Falls back to a plain-text render without `uv`.
 
 ## Requirements
 
@@ -19,6 +19,7 @@ A live dashboard pane shows per-issue stage, elapsed time, and a final verdict s
 - [`codex`](https://github.com/openai/codex) — used as the second reviewer.
 - [`gh`](https://cli.github.com/) — authenticated (`gh auth login`) with `repo`, `project`, and `workflow` scopes.
 - `python3` — runs the monitoring/orchestration script.
+- [`uv`](https://docs.astral.sh/uv/) (recommended) — provisions the TUI dashboard's env (python ≥3.10 + textual) on first use; without it the dashboard falls back to a plain-text render.
 
 ## Install
 
@@ -73,7 +74,8 @@ The dispatcher confirms the resolved work list before spawning anything, so you 
 dual-author/
 ├── SKILL.md            # the skill definition (dispatcher + worker roles)
 └── scripts/
-    └── monitor.py      # polling / dashboard / review state-machine
+    ├── monitor.py      # polling / renames / review state-machine / data collection
+    └── dashboard.py    # Textual TUI dashboard (run by `monitor.py watch` via uv)
 ```
 
 ## License

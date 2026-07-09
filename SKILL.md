@@ -1,6 +1,6 @@
 ---
 name: dual-author
-description: "Self-orchestrating issue pipeline inside herdr. For each GitHub issue: herdr creates a worktree workspace, a named Claude worker agent implements the issue, pushes a draft PR, spawns named codex + claude reviewer agents in tab splits, monitors PR bot comments and checks, fixes findings, and re-reviews with fresh reviewer instances each round until clean — then marks the PR ready and arms auto-merge (merges only when all checks pass). The dispatcher pane shows a live progress dashboard and final verdict summary. Requires HERDR_ENV=1, gh, codex, claude. Use when asked to dual-author, swarm issues, work through a project board, or auto-implement-and-review issues in herdr."
+description: "Self-orchestrating issue pipeline inside herdr. For each GitHub issue: herdr creates a worktree workspace, a named Claude worker agent implements the issue, pushes a draft PR, spawns named codex + claude reviewer agents in tab splits, monitors PR bot comments and checks, fixes findings, and re-reviews with fresh reviewer instances each round until clean — then marks the PR ready and arms auto-merge (merges only when all checks pass). The dispatcher pane shows a live full-screen TUI dashboard (issues table, PR/checks/review detail, pipeline-graph view) and final verdict summary. Requires HERDR_ENV=1, gh, codex, claude; uv recommended for the TUI (plain-text fallback without it). Use when asked to dual-author, swarm issues, work through a project board, or auto-implement-and-review issues in herdr."
 ---
 
 # dual-author — implement + dual-review issues in herdr
@@ -18,6 +18,35 @@ herdr-managed pane and stop.
 Use `herdr agent ...` for anything that is an agent (workers, reviewers) — named
 targets, state waits, reads by name. Use `herdr pane ...` only for plain terminals
 (running tests, tailing logs).
+
+---
+
+## Configuration
+
+All model/agent/concurrency/merge choices live in a TOML config — **do not hardcode
+them in commands**. `scripts/monitor.py` reads it at runtime; precedence (later wins):
+
+1. built-in defaults in `monitor.py`
+2. `~/.claude/skills/dual-author/config.toml` — the shipped defaults (edit this)
+3. `<repo>/.dual-author.toml` — per-repo override (committable)
+4. `$DUAL_AUTHOR_CONFIG=/path.toml` — explicit override
+
+Key sections (see `config.toml` for the annotated full set):
+
+- `[author]` — **which agent implements each issue.** `tool = "claude"` (default) or
+  `tool = "codex"`. So the "main authoring" can be codex by flipping one line. `model` /
+  `effort` (claude) or `model` (codex) tune it; codex authors get a permissive sandbox
+  so they can push/gh/run tools.
+- `[[review.reviewers]]` — the review panel (any mix/count of codex + claude, each with
+  its own model/effort). Default is codex + claude. A codex slot that can't spawn is
+  auto-substituted with claude for that round.
+- `[dispatch] parallel` — issues in flight (default 3).
+- `[review] timeout_mins`, `[merge]` (enabled/auto/method/delete_branch), `[timeouts]`.
+
+Read a value in a command with `monitor.py config <dotted.key>` (e.g.
+`monitor.py config dispatch.parallel`); dump the whole resolved config with
+`monitor.py config`. Never bake a model name or agent into a launch line — go through
+the config so a user edit takes effect without touching the skill.
 
 ---
 
@@ -121,13 +150,17 @@ grep -qF "[projects.\"$WT_PATH\"]" ~/.codex/config.toml 2>/dev/null \
 
 Start the worker **in the workspace's existing root pane** (do NOT `agent start
 --workspace` — that adds a second pane and leaves the root shell orphaned). Write the
-issue brief to a FILE and pass a SHORT prompt that references it — long inline prompts
-get silently truncated mid-typing by `pane run`:
+issue brief AND the short launch instruction to FILES — `monitor.py author-launch`
+runs the **configured** author agent (claude or codex, per `config.toml [author]`) in
+the pane via a launch script, so the tool/model isn't hardcoded and the prompt can't be
+truncated mid-typing by `pane run`:
 
 ```bash
 BRIEF="$BASE/issue-$N-brief.txt"
 printf '%s\n\n%s\n' "<title>" "<full issue body / context>" > "$BRIEF"
-herdr pane run "$ROOT_PANE" "claude --model opus --effort high 'Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER role exactly. You are in a git worktree on branch issue/$N for GitHub issue #$N. Read $BRIEF for the full issue brief. Base branch: main.'"
+LAUNCH="$BASE/issue-$N-launch.txt"
+printf '%s\n' "Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER role exactly. You are in a git worktree on branch issue/$N for GitHub issue #$N. Read $BRIEF for the full issue brief. Base branch: main." > "$LAUNCH"
+python3 ~/.claude/skills/dual-author/scripts/monitor.py author-launch --pane "$ROOT_PANE" --prompt-file "$LAUNCH" --cwd "$WT_PATH"
 # Register the worker against STABLE handles (terminal id + workspace), then give it an
 # initial display name. Routing now goes through the registry, NOT the agent name — the
 # dashboard renames the agent to "⚙️ $NS-issue-$N · <phase>" each tick, so the name is
@@ -184,9 +217,10 @@ gh api graphql -f owner="$OWNER" -f repo="$REPO" -F num="$N" -f query='
 automations move closed issues to Done. For PRs that end draft/unmerged, the label
 correctly stays.)
 
-**Concurrency**: default 3 issues in flight (≈9 agents); `--parallel <n>` in args
-overrides. Spawn up to the cap, queue the rest; when a worker prints its verdict,
-dispatch the next queued issue (create its worktree lazily, at dispatch time).
+**Concurrency**: default from `monitor.py config dispatch.parallel` (config.toml
+`[dispatch] parallel`, ships at 3) issues in flight; `--parallel <n>` in args overrides
+the config for this run. Spawn up to the cap, queue the rest; when a worker prints its
+verdict, dispatch the next queued issue (create its worktree lazily, at dispatch time).
 
 **Queue file**: the dashboard reads the pending queue live from
 `$BASE/queue.txt` (one issue number per line, dispatch order). Write it
@@ -204,7 +238,7 @@ grep -vx 854 "$BASE/queue.txt" > "$BASE/queue.txt.new" && mv "$BASE/queue.txt.ne
 Do NOT poll by repeatedly running herdr commands yourself — that burns tokens and
 floods the transcript. All polling lives in `~/.claude/skills/dual-author/scripts/monitor.py`.
 
-**Live dashboard pane** (pure shell loop, zero LLM involvement): split a small pane off
+**Live dashboard pane** (full-screen Textual TUI, zero LLM involvement): split a pane off
 `$HERDR_PANE_ID` (your origin pane — NOT the focused pane) and run watch mode in it, so
 the dashboard lands in the workspace where `/dual-author` was called:
 
@@ -217,16 +251,30 @@ herdr pane run "$DASH" "DUAL_AUTHOR_NS=$NS python3 ~/.claude/skills/dual-author/
 ```
 
 Argless watch is **self-updating** — start it ONCE and never restart it. Each tick it
-auto-discovers active workers (agents named `$NS-issue-<N>`, scoped to this repo's
-namespace) and reads the pending queue from `$BASE/queue.txt`: newly dispatched issues
-appear on their own, merged/recycled ones drop off, queued issues show as ⏳ rows with
-the next-up one marked `◀ next`. It also shows per-issue elapsed time (total + time in
+auto-discovers active workers (via the registry, scoped to this repo's namespace) and
+reads the pending queue from `$BASE/queue.txt`: newly dispatched issues appear on
+their own, merged/recycled ones drop off, queued issues show as ⏳ rows with the
+next-up one marked `◀ next`. It also shows per-issue elapsed time (total + time in
 current phase), persisted in `$BASE/monitor-state.json` so even a dashboard restart doesn't
 reset the clocks. Your only duty is keeping `queue.txt` current (step 2).
 
-Watch mode also live-renames each issue's workspace label to its stage
-(`issue-852 ⚙️ review-round-1`), so the sidebar doubles as a status board — don't
-rename those workspaces yourself while it runs.
+In a TTY, watch runs a full-screen Textual dashboard (via `uv run`, which provisions
+python+textual in a cached env on first use — no manual install): a selectable issues
+table (status, phase, timings, PR, checks), a detail panel for the selected issue
+(PR + checks, per-round reviewer verdicts, a live tail of the worker's pane), an
+activity feed of phase transitions, and a `[g]` graph view showing the blocking DAG
+across the run's issues (GitHub issue dependencies + "blocked by #N" body
+conventions, queued issues included) above every issue's full pipeline chain
+(implement → draft PR → review rounds → checks → merge).
+Keys: ↑↓/jk select · Enter/f focus the worker's pane · g graph · o open PR · r poll
+· q quit (the pipeline keeps running). Without uv, or with `--legacy`, or when stdout
+isn't a TTY, it falls back to the plain-text render.
+
+Watch mode also live-renames each issue's workspace label AND worker-agent name to
+its stage (`⚙️ <ns>-issue-852 · review-round-1`) and the issue's TAB to
+`#852 · <repo-name>` (tabs otherwise sit at their default number), so the sidebar,
+agents page, and tab strip all double as a status board — don't rename those
+workspaces/tabs yourself while it runs.
 
 **Your event loop**: block on wait mode in a single Bash call (timeout 600000); it
 exits ONLY when something needs you, printing `EVENT ...` lines:
@@ -383,8 +431,12 @@ file:line per finding.
 PROMPT
 
 python3 ~/.claude/skills/dual-author/scripts/monitor.py review <N> r<k> \
-  --prompt-file "$RD/r<k>-prompt.txt" --cwd "$(pwd)" --timeout-mins 15
+  --prompt-file "$RD/r<k>-prompt.txt" --cwd "$(pwd)"   # --timeout-mins defaults from config
 ```
+
+The reviewer panel (which tools, models, how many) comes from `config.toml`
+`[[review.reviewers]]` — the runner spawns whatever is configured. Do not assume
+exactly codex+claude when reading results; iterate the JSON's slots.
 
 The runner blocks for the whole round (run it with a generous Bash timeout) and
 prints JSON: `{"codex": {"file": ..., "verdict": "PASS|FAIL|CANCELLED|MISSING|SPAWN-FAILED"},
@@ -476,12 +528,19 @@ printf '## Acceptance criteria — evidence\n\n| Criterion | Proving test | CI j
 gh issue comment "$N" --body-file "$BASE/issue-$N-accomment.md"
 ```
 
-Then mark the PR ready and enable auto-merge so it merges only once ALL checks pass —
-never merge with failing or pending checks yourself:
+Then mark the PR ready and merge per `config.toml [merge]` — with `auto = true` (default)
+it merges only once ALL checks pass; never merge with failing or pending checks yourself.
+If `merge.enabled = false`, mark ready and STOP (a human merges):
 
 ```bash
 gh pr ready "$PR"
-gh pr merge "$PR" --auto --squash --delete-branch
+MONITOR=~/.claude/skills/dual-author/scripts/monitor.py
+if [ "$(python3 $MONITOR config merge.enabled)" = "true" ]; then
+  FLAGS="--$(python3 $MONITOR config merge.method)"
+  [ "$(python3 $MONITOR config merge.auto)" = "true" ] && FLAGS="--auto $FLAGS"
+  [ "$(python3 $MONITOR config merge.delete_branch)" = "true" ] && FLAGS="$FLAGS --delete-branch"
+  gh pr merge "$PR" $FLAGS
+fi
 ```
 
 After arming, wait (bounded, ~15 min) for the merge to actually land:

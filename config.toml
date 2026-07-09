@@ -1,0 +1,82 @@
+# dual-author configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Edit this file to change which agents author and review issues, concurrency,
+# merge policy, and the monitor's timing tunables. Nothing here needs a code
+# change — monitor.py reads it at runtime.
+#
+# Precedence (later overrides earlier):
+#   1. built-in DEFAULTS in monitor.py
+#   2. this file (skill-wide defaults)
+#   3. <repo>/.dual-author.toml           (per-repo override, committable)
+#   4. $DUAL_AUTHOR_CONFIG=/path/to.toml   (explicit override)
+# A scalar/list replaces; the reviewers list replaces wholesale (not merged).
+#
+# Inspect the effective config any time:  monitor.py config
+# Read one value:                         monitor.py config author.tool
+
+
+# ── who IMPLEMENTS each issue (the "main authoring") ─────────────────────────
+[author]
+tool   = "claude"        # "claude" or "codex"
+model  = "opus"          # claude: opus|sonnet|haiku   codex: model slug, or "" for its default
+effort = "high"          # claude only: low|medium|high (ignored for codex)
+# extra_args = ["--foo"] # appended verbatim to the launch argv (escape hatch)
+
+# codex-as-author needs to push, call gh, run dev tools — so it authors with a
+# permissive sandbox (a reviewer codex stays locked down; see [[review.reviewers]]).
+# To make codex the author, set tool = "codex" above. These apply only then (the
+# codex_* keys are kept separate from model/effort so they don't clash with claude):
+codex_sandbox  = "danger-full-access"   # or "workspace-write" for network-off, in-tree-only
+codex_approval = "never"                # never | on-request | on-failure | untrusted
+codex_model    = "gpt-5.3-codex"        # latest agentic-coding model (gpt-5.5 = latest general)
+codex_effort   = "high"                 # reasoning effort: minimal | low | medium | high | xhigh
+
+
+# ── how many issues run at once ──────────────────────────────────────────────
+[dispatch]
+parallel = 5             # issues in flight (~3 agents each: 1 worker + 2 reviewers)
+
+
+# ── the review panel ─────────────────────────────────────────────────────────
+[review]
+timeout_mins = 15        # per reviewer, per round
+
+# Each [[review.reviewers]] is one reviewer. Order sets split placement
+# (right, down, right, …). Any mix/count of codex + claude. A codex slot that is
+# forced down (codex-down sentinel) or fails to spawn is auto-substituted with a
+# fresh claude for that round, so a round is always decided.
+[[review.reviewers]]
+slot           = "codex"          # stable id used in file/agent names
+tool           = "codex"
+model          = ""               # "" = codex default model
+codex_sandbox  = "workspace-write"
+codex_approval = "never"
+
+[[review.reviewers]]
+slot   = "claude"
+tool   = "claude"
+model  = "sonnet"                 # opus while its weekly cap has headroom; sonnet is the safe default
+effort = "high"
+
+# Example — a third reviewer, or an all-claude panel (comment out the codex one):
+# [[review.reviewers]]
+# slot = "claude2"
+# tool = "claude"
+# model = "opus"
+# effort = "high"
+
+
+# ── what happens to a clean PR (WORKER step 4) ───────────────────────────────
+[merge]
+enabled       = true     # false → leave the PR marked ready but let a human merge
+auto          = true     # true → `gh pr merge --auto` (merges once all checks pass)
+method        = "squash" # squash | merge | rebase
+delete_branch = true
+
+
+# ── monitor timing tunables (rarely need changing) ───────────────────────────
+[timeouts]
+reviewer_idle_sweep_secs    = 180    # idle reviewer pane closed after this
+reviewer_unknown_sweep_secs = 600    # crashed/undetected reviewer reaped after this
+codex_down_ttl_secs         = 5400   # codex-down sentinel self-expiry (90 min)
+pr_poll_secs                = 60     # per-issue `gh pr` merged-state poll budget

@@ -16,11 +16,20 @@ from those. Reviewers stay routed by their per-round spawn names (never renamed)
 
 Usage:
   monitor.py ns                                              print the resolved namespace and exit
+  monitor.py config [<a.b.c>]                                print resolved config (all as JSON, or one dotted key)
+  monitor.py author-launch --pane <P> --prompt-file <F> [--cwd <D>]
+                                                             launch the configured AUTHOR agent (claude|codex) in a pane
   monitor.py register <N> --workspace <ws> --pane <pane>     record a worker's stable handles (at dispatch)
   monitor.py unregister <N>                                  drop a worker (on recycle/cleanup)
   monitor.py worker-pane <N>                                 print the worker's current pane id (for agent read/focus)
   monitor.py close-reviewers <N>                             close all non-worker panes in the issue's workspace
-  monitor.py watch [<issue>...]                              loop forever, redraw dashboard (run in a pane)
+  monitor.py watch [--legacy] [<issue>...]                   full-screen Textual dashboard (run in a pane);
+                                                             --legacy or a non-TTY = old plain-text render
+  monitor.py collect [--queued N,N] [<issue>...]             headless data loop for the dashboard: one
+                                                             collect_tick per poll interval (5/20/60s via
+                                                             <base>/poll-interval, dashboard [p] key) ->
+                                                             <base>/dashboard.json (spawned by
+                                                             dashboard.py; exits with it)
   monitor.py wait  [--seen ev1,ev2] [--queued N,N] <issue>... block until an unseen event, print it, exit 0
   monitor.py review <issue> <tag> --prompt-file F [--cwd D] [--timeout-mins M]
         run ONE full dual-review round as a state machine: spawn codex+claude
@@ -40,8 +49,17 @@ workers and the queue from /tmp/dual-author/<ns>/queue.txt (one issue number per
 dispatch order — maintained by the dispatcher). New issues appear automatically;
 unregistered ones drop off; queued ones show as ⏳ rows with the next one marked. It
 also renames each worker's agent AND its workspace to one icon-led title
-(`⚙️ <ns>-issue-<N> · <phase>`) so the agents page and spaces page both show status.
-No restarts needed. Explicit positional issues pin the active set instead (legacy).
+(`⚙️ <ns>-issue-<N> · <phase>`), and the issue's TAB to `#<N> · <repo-name>`, so the
+agents page, spaces page, and tab strip all show status. No restarts needed. Explicit
+positional issues pin the active set instead (legacy).
+
+watch in a TTY runs the full-screen Textual dashboard (dashboard.py, via `uv run` —
+uv provisions python+textual in a cached env on first use): issues table + detail
+panel (PR/checks, review-round verdicts, live worker-output tail), activity feed,
+and a [g] pipeline-graph view of every issue — all clipped to one viewport.
+Keys: ↑↓/jk select, Enter focus worker pane, g graph, o open PR, r poll, q quit
+(quitting only closes the dashboard; the pipeline keeps running). `--legacy`, a
+non-TTY stdout, or missing uv falls back to the old plain-text render.
 
 watch also auto-sweeps reviewer panes (any non-worker pane in a registered issue's
 workspace): idle ≥ 3 min → closed (review file is on disk; nobody reads the pane);
@@ -62,6 +80,7 @@ Events printed by `wait` (one per line, after a final dashboard render):
 --seen takes handled event ids: verdict-<N>, input-<N>, missing-<N>.
 """
 import contextlib
+import copy
 import json
 import os
 import re
@@ -83,14 +102,10 @@ BASE_ROOT = "/tmp/dual-author"
 # `gh repo view` in every context (dispatcher cwd, worker worktrees, reviewer
 # panes all share one repo → one namespace), so nothing has to be threaded by
 # hand. DUAL_AUTHOR_NS overrides it (e.g. two namespaces for one repo).
-# Reviewers are one-shot: sustained idle == finished (review file already on disk).
-# Grace must outlive the worker's wait→read-file cycle (seconds), not the review itself.
-REVIEWER_IDLE_SWEEP_SECS = 180
-REVIEWER_UNKNOWN_SWEEP_SECS = 600  # crashed/undetected: keep a forensics window, then reap
-# codex-down sentinel self-expiry: a manually-dropped codex-down flag is honored
-# only while fresh, then auto-removed so a forgotten flag can't silently pin every
-# round to dual-claude forever (it used to have NO removal path at all).
-CODEX_DOWN_TTL_SECS = 90 * 60
+# Tunables (reviewer sweep windows, codex-down TTL, PR-poll budget) and all
+# model/agent/concurrency choices now live in a TOML config — see cfg() below and
+# config.toml in the skill root. Reference them via cfg()["timeouts"][...] etc. so a
+# user edit takes effect without touching this file.
 
 # capture ACROSS newlines: the TUI hard-wraps lines mid-word, so grab a window
 # after "phase:", strip whitespace, then match against the known phase vocabulary.
@@ -107,6 +122,246 @@ ICON = {"working": "⚙️", "blocked": "🔴", "idle": "✅", "unknown": "❔",
 
 def sh(*args):
     return subprocess.run(args, capture_output=True, text=True).stdout
+
+
+# ---- configuration ---------------------------------------------------------
+# Everything a user is likely to want to change — which agent AUTHORS each issue
+# (claude OR codex), the review panel (any mix of codex/claude, models, effort),
+# concurrency, merge policy, and the monitor tunables — is read from a TOML file.
+# No tomllib on Python 3.9 (macOS system python), so a tiny dependency-free parser
+# handles the subset the config uses. Precedence (low → high, later wins):
+#   1. config.toml shipped in the skill root (the documented defaults)
+#   2. <repo>/.dual-author.toml (per-repo override, committable)
+#   3. $DUAL_AUTHOR_CONFIG (explicit path)
+# and DEFAULTS below underpins all three so the skill still runs with no file.
+
+DEFAULTS = {
+    # The agent that IMPLEMENTS each issue — the "main authoring". Set tool="codex"
+    # to have codex author. codex authors need to push/gh/run tools, so they default
+    # to a permissive sandbox (unlike the read-only-ish reviewer codex).
+    "author": {"tool": "claude", "model": "opus", "effort": "high",
+               "extra_args": [], "codex_sandbox": "danger-full-access",
+               "codex_approval": "never", "codex_model": "gpt-5.3-codex",
+               "codex_effort": "high"},
+    "dispatch": {"parallel": 3},
+    "review": {
+        "timeout_mins": 15,
+        # The review panel. Order sets split placement (right, down, …). Each entry:
+        # slot (stable id used in file/agent names), tool (codex|claude), and
+        # optional model/effort/extra_args (+ codex_sandbox/codex_approval).
+        "reviewers": [
+            {"slot": "codex", "tool": "codex", "model": "", "effort": "",
+             "codex_sandbox": "workspace-write", "codex_approval": "never",
+             "extra_args": []},
+            {"slot": "claude", "tool": "claude", "model": "sonnet",
+             "effort": "high", "extra_args": []},
+        ],
+    },
+    # Merge policy for a clean PR (WORKER step 4). enabled=false leaves PRs ready but
+    # unmerged for a human to merge.
+    "merge": {"enabled": True, "auto": True, "method": "squash", "delete_branch": True},
+    "timeouts": {"reviewer_idle_sweep_secs": 180, "reviewer_unknown_sweep_secs": 600,
+                 "codex_down_ttl_secs": 90 * 60, "pr_poll_secs": 60},
+}
+
+
+def _toml_strip_comment(line):
+    out, q = [], None
+    for c in line:
+        if q:
+            out.append(c)
+            if c == q:
+                q = None
+        elif c in ('"', "'"):
+            q = c
+            out.append(c)
+        elif c == "#":
+            break
+        else:
+            out.append(c)
+    return "".join(out).rstrip()
+
+
+def _toml_split_array(s):
+    parts, cur, q, depth = [], [], None, 0
+    for c in s:
+        if q:
+            cur.append(c)
+            if c == q:
+                q = None
+        elif c in ('"', "'"):
+            q = c
+            cur.append(c)
+        elif c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+            cur.append(c)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return parts
+
+
+def _toml_value(s):
+    s = s.strip()
+    if not s:
+        return ""
+    if s[0] == "[" and s[-1] == "]":
+        return [_toml_value(x) for x in _toml_split_array(s[1:-1])]
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        inner = s[1:-1]
+        if s[0] == '"':
+            inner = (inner.replace('\\"', '"').replace("\\n", "\n")
+                     .replace("\\t", "\t").replace("\\\\", "\\"))
+        return inner
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
+def _toml_table(root, parts):
+    d = root
+    for p in parts:
+        nxt = d.get(p)
+        if isinstance(nxt, list):
+            d = nxt[-1]
+        elif isinstance(nxt, dict):
+            d = nxt
+        else:
+            nxt = {}
+            d[p] = nxt
+            d = nxt
+    return d
+
+
+def _toml_load(text):
+    """Parse the TOML subset the config uses: [tables], [[arrays.of.tables]],
+    string/int/float/bool scalars, and inline string arrays. Good enough for a
+    hand-edited config file whose shape we control; not a general TOML parser."""
+    root = {}
+    cur = root
+    for raw in text.splitlines():
+        line = _toml_strip_comment(raw).strip()
+        if not line:
+            continue
+        if line.startswith("[[") and line.endswith("]]"):
+            parts = [p.strip() for p in line[2:-2].split(".")]
+            parent = _toml_table(root, parts[:-1])
+            lst = parent.get(parts[-1])
+            if not isinstance(lst, list):
+                lst = []
+                parent[parts[-1]] = lst
+            cur = {}
+            lst.append(cur)
+        elif line.startswith("[") and line.endswith("]"):
+            parts = [p.strip() for p in line[1:-1].split(".")]
+            cur = _toml_table(root, parts)
+        elif "=" in line:
+            k, v = line.split("=", 1)
+            cur[k.strip()] = _toml_value(v)
+    return root
+
+
+def _deep_merge(base_d, over):
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base_d.get(k), dict):
+            _deep_merge(base_d[k], v)
+        else:
+            base_d[k] = v  # scalars + lists (e.g. reviewers) replace wholesale
+    return base_d
+
+
+def _config_paths():
+    paths = [os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "config.toml"))]
+    root = sh("git", "rev-parse", "--show-toplevel").strip()
+    if root:
+        paths.append(os.path.join(root, ".dual-author.toml"))
+    env = os.environ.get("DUAL_AUTHOR_CONFIG")
+    if env:
+        paths.append(env)
+    return paths  # low → high precedence
+
+
+_CFG = None
+
+
+def cfg():
+    global _CFG
+    if _CFG is None:
+        merged = copy.deepcopy(DEFAULTS)
+        for path in _config_paths():
+            try:
+                with open(path) as f:
+                    _deep_merge(merged, _toml_load(f.read()))
+            except OSError:
+                pass  # file absent — fine, next layer / defaults cover it
+            except Exception as e:  # a malformed file must not brick the pipeline
+                sys.stderr.write(f"[dual-author] warning: could not parse {path}: {e}\n")
+        _CFG = merged
+    return _CFG
+
+
+def cfg_get(dotted):
+    d = cfg()
+    for p in dotted.split("."):
+        if isinstance(d, dict):
+            d = d.get(p)
+        else:
+            return None
+    return d
+
+
+def _build_argv(spec, role):
+    """Launch argv for one agent from its config spec. role is 'author' or 'review'
+    — it only changes codex sandbox defaults (an author must push/gh/run tools; a
+    reviewer stays sandboxed to workspace-write + the review temp dir)."""
+    tool = spec.get("tool", "claude")
+    extra = list(spec.get("extra_args") or [])
+    if tool == "codex":
+        approval = spec.get("codex_approval", "never")
+        sandbox = spec.get("codex_sandbox") or (
+            "danger-full-access" if role == "author" else "workspace-write")
+        argv = ["codex", "--ask-for-approval", approval, "--sandbox", sandbox]
+        if role != "author" and sandbox == "workspace-write":
+            # reviewer must write its VERDICT file under /tmp/dual-author (outside the
+            # worktree); realpath resolves macOS /tmp -> /private/tmp for the policy.
+            review_root = os.path.realpath(os.path.dirname(base()))
+            argv += ["-c", f'sandbox_workspace_write.writable_roots=["{review_root}"]']
+        # reasoning effort is a codex config key (minimal|low|medium|high|xhigh).
+        effort = spec.get("codex_effort")
+        if effort:
+            argv += ["-c", f'model_reasoning_effort="{effort}"']
+        # codex_model is the codex-only model slug — kept distinct from `model` (the
+        # claude model) so the two tools don't collide on one shared key.
+        model = spec.get("codex_model") or spec.get("model")
+        if model:
+            argv += ["-m", model]
+        return argv + extra
+    argv = ["claude"]  # claude (default)
+    if spec.get("model"):
+        argv += ["--model", spec["model"]]
+    if spec.get("effort"):
+        argv += ["--effort", spec["effort"]]
+    return argv + extra
+
+
+def author_argv():
+    return _build_argv(cfg()["author"], "author")
 
 
 def agents():
@@ -130,6 +385,16 @@ def _repo():
     if _REPO is None:
         _REPO = sh("gh", "repo", "view", "--json", "nameWithOwner",
                    "-q", ".nameWithOwner").strip()
+        if not _REPO and os.environ.get("DUAL_AUTHOR_NS"):
+            # dashboard/collector pane: cwd is outside the repo, but the ns is
+            # pinned via env, so read the repo `register` recorded at dispatch.
+            # (Guarded on DUAL_AUTHOR_NS: without it base() would recurse into
+            # ns() -> _repo().) Enables PR polling + tab labels from any pane.
+            try:
+                with open(os.path.join(base(), "repo.txt")) as f:
+                    _REPO = f.read().strip()
+            except OSError:
+                pass
     return _REPO
 
 
@@ -224,6 +489,13 @@ def register(issue, workspace, pane):
     reg = load_registry()
     reg[str(issue)] = {"ws": workspace, "term": _terminal_of(pane), "root_pane": pane}
     save_registry(reg)
+    r = _repo()
+    if r:  # record owner/repo so panes outside the repo (dashboard) can resolve it
+        try:
+            with open(os.path.join(base(), "repo.txt"), "w") as f:
+                f.write(r)
+        except OSError:
+            pass
 
 
 def unregister(issue):
@@ -256,27 +528,120 @@ def worker_pane(issue):
     return a.get("pane_id") if a else None
 
 
-_PR_CACHE = {}  # issue -> (last_check_ts, merged_bool); merged is terminal
-PR_POLL_SECS = 60  # per-issue gh poll budget — cheap enough, far under rate limits
+_PR_CACHE = {}  # issue -> (last_check_ts, info_dict|None); a MERGED info is terminal
 
 
-def pr_merged(issue):
+def pr_info(issue):
+    """PR facts for branch issue/<N> — {number,url,state,draft,checks:{ok,fail,
+    pending}} or None. Polled at most every timeouts.pr_poll_secs per issue;
+    MERGED is terminal and never re-polled. Feeds both the merge ground truth
+    and the dashboard's PR/checks columns."""
     now = time.time()
-    ts, merged = _PR_CACHE.get(issue, (0.0, False))
-    if merged:
-        return True
-    if now - ts < PR_POLL_SECS:
-        return False
+    ts, info = _PR_CACHE.get(issue, (0.0, None))
+    if info and info.get("state") == "MERGED":
+        return info
+    if now - ts < cfg()["timeouts"]["pr_poll_secs"]:
+        return info
     repo = _repo()
     if repo:
         out = sh("gh", "pr", "list", "--repo", repo, "--head", f"issue/{issue}",
-                 "--state", "merged", "--json", "number")
+                 "--state", "all", "--limit", "1", "--json",
+                 "number,url,state,isDraft,statusCheckRollup")
         try:
-            merged = bool(json.loads(out))
+            lst = json.loads(out)
+            if lst:
+                p = lst[0]
+                ok = fail = pend = 0
+                for chk in p.get("statusCheckRollup") or []:
+                    # CheckRun rows carry status/conclusion; StatusContext rows carry state
+                    concl = (chk.get("conclusion") or chk.get("state") or "").upper()
+                    status = (chk.get("status") or "").upper()
+                    if concl in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+                        ok += 1
+                    elif concl in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT",
+                                   "ACTION_REQUIRED", "STALE"):
+                        fail += 1
+                    elif status in ("QUEUED", "IN_PROGRESS") or concl in ("", "PENDING", "EXPECTED"):
+                        pend += 1
+                info = {"number": p.get("number"), "url": p.get("url"),
+                        "state": p.get("state"), "draft": p.get("isDraft"),
+                        "checks": {"ok": ok, "fail": fail, "pending": pend}}
+            else:
+                info = None
         except Exception:
-            merged = False
-    _PR_CACHE[issue] = (now, merged)
-    return merged
+            pass  # keep the previous info on a flaky gh call
+    _PR_CACHE[issue] = (now, info)
+    return info
+
+
+def pr_merged(issue):
+    info = pr_info(issue)
+    return bool(info and info.get("state") == "MERGED")
+
+
+_DEP_CACHE = {}  # issue -> (last_check_ts, [blocking issue numbers as str])
+
+
+def blocked_by(issue):
+    """Issue numbers this issue is blocked by — GitHub's native issue
+    dependencies (REST /dependencies/blocked_by), falling back to 'blocked by
+    #N' / 'depends on #N' conventions in the body. Cached 5 min per issue;
+    feeds the dashboard's DAG view."""
+    issue = str(issue).lstrip("#")
+    now = time.time()
+    ts, deps = _DEP_CACHE.get(issue, (0.0, None))
+    if deps is not None and now - ts < 300:
+        return deps
+    deps = []
+    repo = _repo()
+    if repo:
+        out = sh("gh", "api", f"repos/{repo}/issues/{issue}/dependencies/blocked_by",
+                 "--jq", "[.[].number]")
+        try:
+            deps = [str(n) for n in json.loads(out)]
+        except Exception:
+            deps = []
+        if not deps:
+            body = sh("gh", "issue", "view", issue, "--repo", repo,
+                      "--json", "body", "-q", ".body")
+            deps = sorted({m for m in re.findall(
+                r"(?:blocked.by|depends.on|requires)\s+#(\d+)", body, re.I)}, key=int)
+    _DEP_CACHE[issue] = (now, deps)
+    return deps
+
+
+def rounds_for(issue):
+    """Review rounds parsed from on-disk review files
+    (<base>/issue-<N>/<tag>-<slot>[2].md) → [{"tag": "r1", "slots": {"codex":
+    "FAIL", "claude": "CANCELLED"}}, ...] in round order. A file whose VERDICT
+    line hasn't landed yet reports "running". Dashboard-only, read-only."""
+    rd = os.path.join(base(), f"issue-{issue}")
+    slots = sorted({str(r.get("slot") or r.get("tool") or i)
+                    for i, r in enumerate(cfg()["review"]["reviewers"])},
+                   key=len, reverse=True)  # longest first: 'codex-x' beats 'codex'
+    rounds = {}
+    try:
+        names = os.listdir(rd)
+    except OSError:
+        return []
+    for fn in names:
+        if not fn.endswith(".md"):
+            continue
+        stem = fn[:-3]
+        for slot in slots:
+            for suffix in (f"-{slot}2", f"-{slot}"):  # '2' = claude-substituted slot
+                if stem.endswith(suffix):
+                    tag = stem[: -len(suffix)]
+                    rounds.setdefault(tag, {})[slot] = _verdict_of(os.path.join(rd, fn)) or "running"
+                    break
+            else:
+                continue
+            break
+
+    def _key(t):
+        return ([int(x) for x in re.findall(r"\d+", t)], t)
+
+    return [{"tag": t, "slots": rounds[t]} for t in sorted(rounds, key=_key)]
 
 
 def discover_issues(ag):
@@ -306,7 +671,10 @@ def snapshot(issues):
             # a vanished agent whose PR merged FINISHED — report verdict, not missing
             rows.append({"issue": n, "status": "missing", "phase": "-",
                          "verdict": pr_merged(n), "input": False,
-                         "workspace_id": (reg.get(str(n)) or {}).get("ws"), "pane_id": None})
+                         "workspace_id": (reg.get(str(n)) or {}).get("ws"),
+                         "pane_id": None, "tab_id": None,
+                         "pr": pr_info(n), "rounds": rounds_for(n),
+                         "blocked_by": blocked_by(n), "tail": []})
             continue
         text = sh("herdr", "pane", "read", a["pane_id"], "--source", "recent-unwrapped", "--lines", "120")
         # phases are single hyphenated tokens; the agent TUI hard-wraps mid-word.
@@ -334,6 +702,12 @@ def snapshot(issues):
             "input": "=== NEEDS INPUT" in text,
             "workspace_id": a.get("workspace_id"),
             "pane_id": a.get("pane_id"),
+            "tab_id": a.get("tab_id"),
+            "pr": pr_info(n),
+            "rounds": rounds_for(n),
+            "blocked_by": blocked_by(n),
+            # last screenfuls of the worker pane, for the dashboard detail panel
+            "tail": [ln.rstrip() for ln in text.splitlines() if ln.strip()][-30:],
         })
     return rows
 
@@ -377,7 +751,7 @@ def sweep_reviewers(state, ag):
 
     A reviewer is identified STRUCTURALLY: any agent sharing a registered issue's
     workspace that is NOT that issue's worker (resolved via the registry). One that
-    has been idle for REVIEWER_IDLE_SWEEP_SECS is done — its review file is on disk
+    has been idle for timeouts.reviewer_idle_sweep_secs is done — review file on disk
     and the worker reads the FILE, never the pane. unknown-status reviewers (crashed)
     get a longer forensics window, then are reaped too. Workers still sweep their own
     panes per SKILL.md; this is the backstop that makes cleanup unconditional.
@@ -407,7 +781,9 @@ def sweep_reviewers(state, ag):
         if rec.get("status") != status:
             rec["status"] = status
             rec["since"] = now
-        grace = {"idle": REVIEWER_IDLE_SWEEP_SECS, "unknown": REVIEWER_UNKNOWN_SWEEP_SECS}.get(status)
+        _t = cfg()["timeouts"]
+        grace = {"idle": _t["reviewer_idle_sweep_secs"],
+                 "unknown": _t["reviewer_unknown_sweep_secs"]}.get(status)
         if grace is not None and now - rec.get("since", now) >= grace:
             sh("herdr", "pane", "close", a["pane_id"])
             rv.pop(key, None)
@@ -445,25 +821,6 @@ def _agent_alive(name):
         return None
 
 
-def _tool_argv(tool):
-    """The reviewer launch argv. claude is pinned to Opus at high effort
-    (deterministic regardless of the user's session defaults).
-
-    codex launches non-interactively-approved: `--ask-for-approval never` so it
-    never stops to ask the user to run a command (its default policy prompts
-    per-command, which stalls an unattended reviewer — claude doesn't because the
-    worktree is pre-trusted). The sandbox stays ON at `workspace-write` (no network,
-    no writes outside the workspace) — we only widen it to also allow the
-    dual-author temp dir, since the reviewer must write its VERDICT file there
-    (outside the worktree). realpath resolves the macOS /tmp -> /private/tmp symlink
-    so the sandbox policy matches the path codex actually writes to."""
-    if tool == "claude":
-        return ["claude", "--model", "opus", "--effort", "high"]
-    review_root = os.path.realpath(os.path.dirname(base()))  # /tmp/dual-author, resolved
-    return ["codex", "--ask-for-approval", "never", "--sandbox", "workspace-write",
-            "-c", f'sandbox_workspace_write.writable_roots=["{review_root}"]']
-
-
 # Machine-global lock that serializes codex reviewer STARTUP (the auth/token-refresh
 # window) across ALL dual-author runs on this host. codex on ChatGPT-subscription auth
 # authenticates against one shared ~/.codex/auth.json whose refresh token is single-use
@@ -494,7 +851,7 @@ def _codex_auth_gate(tool):
             f.close()
 
 
-def _spawn_reviewer(name, base_pane, split, cwd, tool, prompt):
+def _spawn_reviewer(name, base_pane, split, cwd, spec, prompt):
     """Spawn one reviewer; return its pane_id or None. Verifies a LIVE agent.
 
     Primary: `herdr agent start` (prompt as argv — no typing). Verified via the
@@ -507,13 +864,13 @@ def _spawn_reviewer(name, base_pane, split, cwd, tool, prompt):
     don't race the single-use refresh token in the shared ~/.codex/auth.json (the
     SPAWN-FAILED cause); the gate is held only until the agent is alive (auth done).
     """
-    with _codex_auth_gate(tool):
-        return _spawn_reviewer_inner(name, base_pane, split, cwd, tool, prompt)
+    with _codex_auth_gate(spec.get("tool")):
+        return _spawn_reviewer_inner(name, base_pane, split, cwd, spec, prompt)
 
 
-def _spawn_reviewer_inner(name, base_pane, split, cwd, tool, prompt):
+def _spawn_reviewer_inner(name, base_pane, split, cwd, spec, prompt):
     _run("herdr", "agent", "start", name, "--tab", base_pane, "--split", split,
-         "--no-focus", "--cwd", cwd, "--", *_tool_argv(tool), prompt)
+         "--no-focus", "--cwd", cwd, "--", *_build_argv(spec, "review"), prompt)
     for _ in range(6):  # agent start registers the name itself if it worked
         p = _agent_alive(name)
         if p:
@@ -527,7 +884,8 @@ def _spawn_reviewer_inner(name, base_pane, split, cwd, tool, prompt):
     os.makedirs(base(), exist_ok=True)
     script = os.path.join(base(), f"launch-{name}.sh")
     with open(script, "w") as f:
-        f.write(f"#!/bin/zsh\ncd {shlex.quote(cwd)}\nexec {' '.join(_tool_argv(tool))} {shlex.quote(prompt)}\n")
+        argv = " ".join(shlex.quote(a) for a in _build_argv(spec, "review"))
+        f.write(f"#!/bin/zsh\ncd {shlex.quote(cwd)}\nexec {argv} {shlex.quote(prompt)}\n")
     os.chmod(script, 0o755)
     _run("herdr", "pane", "run", pane, script)
     for _ in range(8):
@@ -577,48 +935,62 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
     # quota-dead at OpenAI so rounds don't waste a spawn attempt on it — the codex
     # SLOT is filled with a second independent claude instead, so every round still
     # gets two reviewers. The result key stays "codex" (callers read it structurally);
-    # "tool" records the substitution. The flag SELF-EXPIRES after CODEX_DOWN_TTL_SECS
+    # "tool" records the substitution. The flag SELF-EXPIRES after timeouts.codex_down_ttl_secs
     # so a forgotten sentinel can't silently pin every round to dual-claude forever;
     # once expired we delete it and attempt codex again (the spawn-failure fallback
     # below still covers the case where codex is genuinely still down).
     cd_path = os.path.join(base(), "codex-down")
     codex_down = False
     try:
-        if time.time() - os.path.getmtime(cd_path) < CODEX_DOWN_TTL_SECS:
+        if time.time() - os.path.getmtime(cd_path) < cfg()["timeouts"]["codex_down_ttl_secs"]:
             codex_down = True
         else:
             os.remove(cd_path)  # stale flag — let codex be retried
     except OSError:
         pass  # no sentinel (or it vanished) → attempt codex normally
-    for slot, split in (("codex", "right"), ("claude", "down")):
-        tool, name, outfile = slot, f"{worker}-{slot}-{tag}", f"{rd}/{tag}-{slot}.md"
-        if slot == "codex" and codex_down:
-            tool = "claude"
-            name = f"{worker}-claude-{tag}x"   # still matches the sweep regex
-            outfile = f"{rd}/{tag}-claude2.md"
-        full = (f"{prompt} Write your FULL review to {outfile}, ending the file "
+    # The panel is config-driven: any mix/count of codex+claude reviewers. Split
+    # placement cycles right/down. A claude spec is kept aside to substitute into any
+    # codex slot that's forced down (sentinel) or fails to spawn — so every round
+    # still yields a decided dual (or N-) reviewer verdict.
+    reviewers = cfg()["review"]["reviewers"]
+    splits = ["right", "down"]
+    claude_sub = copy.deepcopy(next((r for r in reviewers if r.get("tool") == "claude"),
+                                    {"tool": "claude", "model": "sonnet", "effort": "high"}))
+
+    def _mk_prompt(outfile):
+        return (f"{prompt} Write your FULL review to {outfile}, ending the file "
                 f"with VERDICT: PASS or VERDICT: FAIL on its own line.")
-        plan[slot] = {"name": name, "file": outfile, "tool": tool,
-                      "prompt": full, "split": split, "pane": None}
+
+    for i, rv in enumerate(reviewers):
+        slot = str(rv.get("slot") or rv.get("tool") or f"r{i}")
+        split = splits[i % len(splits)]
+        spec = copy.deepcopy(rv)
+        name, outfile = f"{worker}-{slot}-{tag}", f"{rd}/{tag}-{slot}.md"
+        if spec.get("tool") == "codex" and codex_down:  # manual skip → claude sub
+            spec = copy.deepcopy(claude_sub)
+            name, outfile = f"{worker}-{slot}-{tag}x", f"{rd}/{tag}-{slot}2.md"
+        plan[slot] = {"name": name, "file": outfile, "spec": spec,
+                      "tool": spec.get("tool"), "prompt": _mk_prompt(outfile),
+                      "split": split, "pane": None}
     results = {}
     try:
         for slot, p in plan.items():  # SPAWN + VERIFY (one retry)
-            p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"])
-                         or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"]))
-            # Self-healing codex fallback: if the codex reviewer can't start (quota
+            p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"])
+                         or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"]))
+            # Self-healing codex fallback: if a codex reviewer can't start (quota
             # dead, or it lost the auth-lock race after both retries) substitute a
-            # fresh claude into the slot for THIS round, so we still get two reviewers
+            # fresh claude into the slot for THIS round, so we still get a full panel
             # and a DECIDED round instead of an undecided SPAWN-FAILED slot. No
             # sentinel needed — codex is attempted from scratch next round, so the
             # moment it recovers it's used again automatically.
             if p["pane"] is None and p["tool"] == "codex":
+                p["spec"] = copy.deepcopy(claude_sub)
                 p["tool"] = "claude"
-                p["name"] = f"{worker}-claude-{tag}x"   # still matches the sweep regex
-                p["file"] = f"{rd}/{tag}-claude2.md"
-                p["prompt"] = (f"{prompt} Write your FULL review to {p['file']}, ending the file "
-                               f"with VERDICT: PASS or VERDICT: FAIL on its own line.")
-                p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"])
-                             or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["tool"], p["prompt"]))
+                p["name"] = f"{worker}-{slot}-{tag}x"
+                p["file"] = f"{rd}/{tag}-{slot}2.md"
+                p["prompt"] = _mk_prompt(p["file"])
+                p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"])
+                             or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"]))
         # COLLECT helper: read a finished reviewer's verdict, re-prompt once if absent.
         def _collect(p):
             v = _verdict_of(p["file"])
@@ -710,7 +1082,16 @@ def save_state(state):
         pass  # monitoring state is advisory — never crash the loop over it
 
 
-def update_timing(state, rows):
+def _push_event(state, issue, text, now):
+    ev = state.setdefault("_events", [])
+    ev.append({"ts": now, "issue": str(issue), "text": text})
+    del ev[:-80]  # rolling feed for the dashboard's activity panel
+
+
+def update_timing(state, rows, record=False):
+    # record=True (watch/dashboard only, so concurrent wait processes don't
+    # double-log) also appends phase transitions / verdicts / needs-input to the
+    # persisted _events feed the dashboard renders.
     now = time.time()
     for r in rows:
         st = state.setdefault(str(r["issue"]), {})
@@ -718,10 +1099,20 @@ def update_timing(state, rows):
             st.clear()
         st.setdefault("start", now)
         if r["phase"] != st.get("phase"):
+            if record and st.get("phase"):
+                _push_event(state, r["issue"], f"{st['phase']} → {r['phase']}", now)
             st["phase"] = r["phase"]
             st["phase_start"] = now
         if r["verdict"] and "done" not in st:
             st["done"] = now
+            if record:
+                _push_event(state, r["issue"], "verdict — finished", now)
+        if record:
+            if r["input"] and not st.get("input_seen"):
+                st["input_seen"] = True
+                _push_event(state, r["issue"], "NEEDS INPUT", now)
+            elif not r["input"]:
+                st.pop("input_seen", None)
     save_state(state)
     return state
 
@@ -763,6 +1154,61 @@ def render(rows, state, queued=()):
     return "\n".join(out)
 
 
+def apply_labels(rows, labels):
+    """Live-rename the herdr surfaces for each issue so every page identifies the
+    work: workspace + agent get the icon-led status title (issue · phase), and the
+    issue's TAB gets `#<N> · <repo-name>` (static — the tab strip otherwise shows a
+    bare tab number). `labels` caches the last value set to avoid rename churn."""
+    repo = _repo()
+    short = repo.split("/")[-1] if repo else ns()
+    for r in rows:
+        label = f"{row_icon(r)} {ns()}-issue-{r['issue']} · {r['phase']}"
+        ws = r.get("workspace_id")
+        if ws and labels.get(("ws", ws)) != label:
+            sh("herdr", "workspace", "rename", ws, label)
+            labels[("ws", ws)] = label
+        pane = r.get("pane_id")  # worker still live → its agents-page title
+        if pane and labels.get(("agent", pane)) != label:
+            sh("herdr", "agent", "rename", pane, label)
+            labels[("agent", pane)] = label
+        tab = r.get("tab_id")
+        tab_label = f"#{r['issue']} · {short}"
+        if tab and labels.get(("tab", tab)) != tab_label:
+            sh("herdr", "tab", "rename", tab, tab_label)
+            labels[("tab", tab)] = tab_label
+
+
+POLL_CHOICES = (5, 20, 60)
+
+
+def poll_interval():
+    """Dashboard/collector polling cadence in seconds — read from
+    <base>/poll-interval (written by the dashboard's [p] key, persists across
+    runs). Anything absent/invalid falls back to 5."""
+    try:
+        with open(os.path.join(base(), "poll-interval")) as f:
+            v = int(f.read().strip())
+        return v if v in POLL_CHOICES else POLL_CHOICES[0]
+    except (OSError, ValueError):
+        return POLL_CHOICES[0]
+
+
+def collect_tick(state, labels, issues_pin=(), queued_pin=()):
+    """One full monitoring tick — shared by legacy `watch` and the curses
+    dashboard's collector thread: discover workers, snapshot (phases, PR, rounds,
+    tails), update timings + activity events, sweep finished reviewer panes, and
+    apply workspace/agent/tab labels. Returns (rows, queued)."""
+    ag = agents()
+    active = list(issues_pin) or discover_issues(ag)
+    q = list(queued_pin) or read_queue(active)
+    rows = snapshot(active)
+    update_timing(state, rows, record=True)
+    sweep_reviewers(state, ag)
+    save_state(state)
+    apply_labels(rows, labels)
+    return rows, q
+
+
 def events(rows, seen):
     ev = []
     for r in rows:
@@ -779,12 +1225,48 @@ def events(rows, seen):
 
 
 def main():
-    modes = ("watch", "wait", "review", "ns", "register", "unregister",
-             "worker-pane", "close-reviewers")
+    modes = ("watch", "wait", "collect", "review", "ns", "register", "unregister",
+             "worker-pane", "close-reviewers", "config", "author-launch")
     if len(sys.argv) < 2 or sys.argv[1] not in modes:
         print(__doc__)
         sys.exit(2)
     mode, rest = sys.argv[1], sys.argv[2:]
+
+    if mode == "config":
+        # `config`            -> whole resolved config as JSON
+        # `config a.b.c`      -> one value (scalar plain, dict/list as JSON); exit 1 if absent
+        if not rest:
+            print(json.dumps(cfg(), indent=2))
+            return
+        v = cfg_get(rest[0])
+        if v is None:
+            sys.exit(1)
+        print(json.dumps(v) if isinstance(v, (dict, list)) else v)
+        return
+
+    if mode == "author-launch":
+        # author-launch --pane <P> --prompt-file <F> [--cwd <D>]: launch the
+        # configured AUTHOR agent (claude or codex) in an existing pane, running a
+        # short launch script (prompt read from the file at exec time → no typing
+        # truncation). Used by the dispatcher instead of a hardcoded `claude` line.
+        opts = {"pane": None, "prompt-file": None, "cwd": os.getcwd()}
+        args = rest
+        while args:
+            opts[args[0].lstrip("-")] = args[1]
+            args = args[2:]
+        if not opts["pane"] or not opts["prompt-file"]:
+            print("author-launch requires --pane and --prompt-file", file=sys.stderr)
+            sys.exit(2)
+        os.makedirs(base(), exist_ok=True)
+        script = os.path.join(base(), f"launch-worker-{os.getpid()}.sh")
+        quoted = " ".join(shlex.quote(a) for a in author_argv())
+        with open(script, "w") as f:
+            f.write(f'#!/bin/zsh\ncd {shlex.quote(opts["cwd"])}\n'
+                    f'exec {quoted} "$(cat {shlex.quote(opts["prompt-file"])})"\n')
+        os.chmod(script, 0o755)
+        sh("herdr", "pane", "run", opts["pane"], script)
+        print(f"launched author ({cfg()['author']['tool']}) in {opts['pane']}")
+        return
 
     if mode == "ns":
         # Resolved namespace for this repo — SKILL.md uses it to build the
@@ -833,7 +1315,9 @@ def main():
 
     if mode == "review":
         issue, tag, args = rest[0].lstrip("#"), rest[1], rest[2:]
-        opts = {"cwd": os.getcwd(), "timeout-mins": "15", "prompt-file": None}
+        opts = {"cwd": os.getcwd(),
+                "timeout-mins": str(cfg()["review"]["timeout_mins"]),
+                "prompt-file": None}
         while args:
             k = args[0].lstrip("-")
             opts[k] = args[1]
@@ -856,30 +1340,74 @@ def main():
     issues = rest
 
     if mode == "watch":
+        legacy = "--legacy" in issues
+        issues = [i for i in issues if i != "--legacy"]
+        if not legacy and sys.stdout.isatty() and (os.environ.get("TERM") or "dumb") != "dumb":
+            # Full-screen Textual dashboard (single viewport, selectable issues,
+            # detail panel, [g] pipeline-graph view), run via `uv run` — uv
+            # provisions python>=3.10 + textual in a cached env on first use.
+            # --legacy / non-TTY / no uv falls back to the plain-text render.
+            uv = None
+            for cand in [os.path.expanduser("~/.local/bin/uv"), "/opt/homebrew/bin/uv"]:
+                if os.path.exists(cand):
+                    uv = cand
+                    break
+            uv = uv or (subprocess.run(["which", "uv"], capture_output=True,
+                                       text=True).stdout.strip() or None)
+            if uv:
+                dash = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.py")
+                argv = [uv, "run", "--quiet", dash, *issues]
+                if queued:
+                    argv += ["--queued", ",".join(queued)]
+                os.execv(uv, argv)  # env (DUAL_AUTHOR_NS) is inherited
+            sys.stderr.write("[dual-author] uv not found; using plain-text watch\n")
         labels = {}  # (kind, id) -> last label set, to avoid rename churn
         while True:
-            ag = agents()
-            active = issues or discover_issues(ag)
-            q = queued or read_queue(active)
-            rows = snapshot(active)
-            state = update_timing(load_state(), rows)
-            sweep_reviewers(state, ag)
-            save_state(state)
+            state = load_state()
+            rows, q = collect_tick(state, labels, issues, queued)
             print("\033[2J\033[H" + render(rows, state, q), flush=True)
-            for r in rows:
-                # one icon-LED title so status is glanceable even when the sidebar
-                # truncates: issue id then current phase. Applied to BOTH the
-                # workspace (spaces page) and the worker agent (agents page).
-                label = f"{row_icon(r)} {ns()}-issue-{r['issue']} · {r['phase']}"
-                ws = r.get("workspace_id")
-                if ws and labels.get(("ws", ws)) != label:
-                    sh("herdr", "workspace", "rename", ws, label)
-                    labels[("ws", ws)] = label
-                pane = r.get("pane_id")  # worker still live → its agents-page title
-                if pane and labels.get(("agent", pane)) != label:
-                    sh("herdr", "agent", "rename", pane, label)
-                    labels[("agent", pane)] = label
             time.sleep(5)
+    elif mode == "collect":
+        # Headless data loop for the Textual dashboard, run as a SEPARATE
+        # PROCESS so the UI can never be blocked by herdr/gh calls (in a
+        # thread, the GIL is held during every subprocess spawn — dozens per
+        # tick — which visibly starved the UI). Writes an atomic JSON snapshot
+        # each tick; `touch <base>/poll-now` forces an immediate re-poll; exits
+        # on its own when the parent dashboard process dies.
+        labels = {}
+        parent = os.environ.get("DUAL_AUTHOR_COLLECT_PPID")
+        snap_path = os.path.join(base(), "dashboard.json")
+        poll_now = os.path.join(base(), "poll-now")
+        while True:
+            state = load_state()
+            err, rows, q, qdeps = None, [], [], {}
+            try:
+                rows, q = collect_tick(state, labels, issues, queued)
+                qdeps = {n: blocked_by(n) for n in q}
+            except Exception as e:  # surface in the UI instead of dying
+                err = f"{type(e).__name__}: {e}"
+            os.makedirs(base(), exist_ok=True)
+            tmp = f"{snap_path}.{os.getpid()}.tmp"
+            try:
+                with open(tmp, "w") as f:
+                    json.dump({"ts": time.time(), "rows": rows, "queue": q,
+                               "qdeps": qdeps, "state": state, "err": err,
+                               "repo": _repo()}, f)
+                os.replace(tmp, snap_path)
+            except OSError:
+                pass
+            waited = 0
+            while waited < poll_interval():  # re-read each second: [p] in the
+                # dashboard changes the cadence mid-sleep (60 → 5 shouldn't
+                # keep sleeping a full minute)
+                if parent and (os.getppid() == 1 or str(os.getppid()) != parent):
+                    sys.exit(0)  # dashboard is gone — don't linger as an orphan
+                if os.path.exists(poll_now):
+                    with contextlib.suppress(OSError):
+                        os.remove(poll_now)
+                    break
+                time.sleep(1)
+                waited += 1
     elif mode == "wait":
         while True:
             rows = snapshot(issues)
