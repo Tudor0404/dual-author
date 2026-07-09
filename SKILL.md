@@ -41,6 +41,12 @@ Key sections (see `config.toml` for the annotated full set):
   its own model/effort). Default is codex + claude. A codex slot that can't spawn is
   auto-substituted with claude for that round.
 - `[dispatch] parallel` — issues in flight (default 3).
+- `[lifecycle]` — **monitor-owned workspace lifecycle** (both on by default):
+  `recycle` = on PR merge (gh ground truth) the monitor closes the issue's panes,
+  unregisters it, removes the worktree workspace, and deletes the local branch;
+  `dispatch` = the monitor itself dispatches queued issues (worktree → author launch
+  → register → in-progress label/board) whenever a slot is free. The dispatcher LLM
+  no longer babysits these transitions — a paused/buried session can't stall the run.
 - `[review] timeout_mins`, `[merge]` (enabled/auto/method/delete_branch), `[timeouts]`.
 
 Read a value in a command with `monitor.py config <dotted.key>` (e.g.
@@ -79,7 +85,7 @@ see the blast radius first.
 
 Gather context for each: `gh issue view <N> --json title,body,labels`.
 
-### 2. Per-issue worktree workspace + worker agent
+### 2. Brief + queue the issues (the monitor dispatches them)
 
 **Resolve the namespace once, up front, then PIN it.** All state, the queue, brief/
 review files, the worker registry, and worker display names are namespaced by repo so a
@@ -98,13 +104,17 @@ agreeing across panes:
 ```bash
 NS=$(python3 ~/.claude/skills/dual-author/scripts/monitor.py ns)   # slug of owner/repo
 BASE="/tmp/dual-author/$NS"; mkdir -p "$BASE"
+python3 ~/.claude/skills/dual-author/scripts/monitor.py set-root   # record the primary checkout
 ```
 
-Use `$BASE/...` for every temp path. The worker's **display** name is
-`⚙️ $NS-issue-$N · <phase>` (set by the dashboard), but you never route by it — you
-`register` each worker and resolve it later via `monitor.py worker-pane $N` (see below).
-(To run two namespaces for the *same* repo, export `DUAL_AUTHOR_NS` before launching and
-pass it to workers — not needed for distinct repos.)
+Use `$BASE/...` for every temp path. `set-root` records the primary checkout's path —
+the monitor's auto-dispatch/recycle cut worktrees and delete merged branches from
+panes outside the repo, so this must be run once, from the repo, before anything is
+queued. The worker's **display** name is `⚙️ $NS-issue-$N · <phase>` (set by the
+dashboard), but you never route by it — workers get `register`ed and resolved later
+via `monitor.py worker-pane $N` (see below). (To run two namespaces for the *same*
+repo, export `DUAL_AUTHOR_NS` before launching and pass it to workers — not needed
+for distinct repos.)
 
 **Sync `main` to `origin/main` ONCE, before the dispatch loop.** `herdr worktree create
 --base main` branches off your **local** `main` ref — it does NOT fetch. If local `main`
@@ -123,6 +133,37 @@ If `main` isn't the currently checked-out branch in the primary worktree, fetch 
 advances the remote-tracking ref; use `git branch -f main origin/main` (only when `main`
 is not checked out anywhere) instead of the `merge --ff-only` above.
 
+**Default flow (`lifecycle.dispatch = true`, the shipped default): you do NOT create
+worktrees or launch workers yourself.** For each issue, write a brief, then queue ALL
+issues and start the dashboard (step 3). The monitor dispatches up to
+`dispatch.parallel` issues itself — worktree off fresh `main`, pre-trust, author
+launch, registration, in-progress label + board Status — and back-fills from the
+queue as issues merge and recycle:
+
+```bash
+# one brief per issue — title + full body + any context worth passing the worker
+printf '%s\n\n%s\n' "<title>" "<full issue body / context>" > "$BASE/issue-$N-brief.txt"
+# ALL issues go in the queue, dispatch order; the monitor pops it as it dispatches
+printf '%s\n' 851 852 853 854 855 > "$BASE/queue.txt"
+```
+
+If a brief file is missing the monitor generates one from the issue title/body via
+`gh issue view` — your hand-written brief is richer (labels, linked context, your
+read of ambiguities), so still write them when you have context to add. The
+in-progress label and board Status="In Progress" moves happen automatically at each
+dispatch. `--parallel <n>` in the run's args: write it to the per-repo override
+(`<repo>/.dual-author.toml`, `[dispatch] parallel = n`) so the monitor honors it.
+
+**Verify pickup**: within ~30s of the dashboard starting, the first
+`dispatch.parallel` issues should appear as ⚙️ rows (the queue drains one per
+monitor tick). If nothing dispatches, check `set-root` was run and the dashboard's
+activity feed for `auto-dispatch failed` events (a queue head that fails 3x is
+dropped with an event — dispatch that issue manually, see below).
+
+<details>
+<summary><b>Manual dispatch</b> — only when <code>lifecycle.dispatch = false</code>
+(or a dropped issue needs hand-dispatching)</summary>
+
 For each issue `N`, one command creates the worktree (at
 `~/.herdr/worktrees/<repo>/<branch>`), a new workspace, and its root pane:
 
@@ -131,22 +172,12 @@ WT_JSON=$(herdr worktree create --cwd "$(git rev-parse --show-toplevel)" \
   --branch "issue/$N" --base main --label "issue-$N" --no-focus --json)
 WS=$(echo "$WT_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["workspace"]["workspace_id"])')
 WT_PATH=$(echo "$WT_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["worktree"]["path"])')
-```
-
-**Pre-trust the worktree path** for both agents so nobody stops at a trust dialog:
-
-```bash
 ROOT_PANE=$(echo "$WT_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
-python3 - "$WT_PATH" <<'EOF'
-import json, sys, os
-p = os.path.expanduser('~/.claude.json')
-d = json.load(open(p))
-d.setdefault('projects', {}).setdefault(sys.argv[1], {})['hasTrustDialogAccepted'] = True
-json.dump(d, open(p, 'w'), indent=2)
-EOF
-grep -qF "[projects.\"$WT_PATH\"]" ~/.codex/config.toml 2>/dev/null \
-  || printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$WT_PATH" >> ~/.codex/config.toml
 ```
+
+Pre-trust the worktree path for both agents (claude: set
+`hasTrustDialogAccepted` under `projects."$WT_PATH"` in `~/.claude.json`; codex:
+append a trusted `[projects."$WT_PATH"]` block to `~/.codex/config.toml`).
 
 Start the worker **in the workspace's existing root pane** (do NOT `agent start
 --workspace` — that adds a second pane and leaves the root shell orphaned). Write the
@@ -156,82 +187,38 @@ the pane via a launch script, so the tool/model isn't hardcoded and the prompt c
 truncated mid-typing by `pane run`:
 
 ```bash
-BRIEF="$BASE/issue-$N-brief.txt"
-printf '%s\n\n%s\n' "<title>" "<full issue body / context>" > "$BRIEF"
+BRIEF="$BASE/issue-$N-brief.txt"   # written in the default-flow step above
 LAUNCH="$BASE/issue-$N-launch.txt"
 printf '%s\n' "Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER role exactly. You are in a git worktree on branch issue/$N for GitHub issue #$N. Read $BRIEF for the full issue brief. Base branch: main." > "$LAUNCH"
 python3 ~/.claude/skills/dual-author/scripts/monitor.py author-launch --pane "$ROOT_PANE" --prompt-file "$LAUNCH" --cwd "$WT_PATH"
-# Register the worker against STABLE handles (terminal id + workspace), then give it an
-# initial display name. Routing now goes through the registry, NOT the agent name — the
-# dashboard renames the agent to "⚙️ $NS-issue-$N · <phase>" each tick, so the name is
-# display-only. Resolve the worker later with `monitor.py worker-pane $N`, never by name.
+# Register against STABLE handles (terminal id + workspace); the agent name is
+# display-only (the dashboard renames it each tick). Resolve the worker later with
+# `monitor.py worker-pane $N`, never by name.
 sleep 3
 python3 ~/.claude/skills/dual-author/scripts/monitor.py register "$N" --workspace "$WS" --pane "$ROOT_PANE"
 herdr agent rename "$ROOT_PANE" "⚙️ $NS-issue-$N · starting"   # retry once if detection lags
-# A fresh worktree can stack TWO claude startup dialogs (the security notice, then
-# the "new MCP servers found" picker) and the worker sits silently at them looking
-# alive but doing nothing. Send Enter 3x, spaced, to clear both regardless of
-# order; harmless empty-submits once the composer is up.
+# A fresh worktree can stack TWO claude startup dialogs (security notice + MCP
+# picker); spaced Enters clear both. Then VERIFY the agent reaches working/idle.
 for _ in 1 2 3; do sleep 6; herdr pane send-keys "$ROOT_PANE" Enter 2>/dev/null; done
-# VERIFY the worker actually started (agent status reaches working/idle with the
-# composer up) — a pane can look launched while stuck at a dialog or a dead shell.
+grep -vx "$N" "$BASE/queue.txt" > "$BASE/queue.txt.new" && mv "$BASE/queue.txt.new" "$BASE/queue.txt"
 ```
 
-Keep the prompt shell-safe (no unescaped quotes).
+Keep the prompt shell-safe (no unescaped quotes). Then mark the issue in-progress —
+`gh label create in-progress ... ; gh issue edit "$N" --add-label in-progress`, and
+move every project board it sits on to Status = "In Progress" (one GraphQL query for
+projectItems + Status field/option ids, then `gh project item-edit` per board — the
+monitor's `_mark_in_progress` in monitor.py is the reference implementation).
 
-**Mark the issue in-progress immediately after dispatch** (every issue, including
-queued ones when their turn comes) so the board reflects pickup in real time. Set
-BOTH signals — the label is the universal heartbeat (works for any issue, no board
-needed); the board Status move is what shows up on a project board's columns:
-
-```bash
-gh label create in-progress --color FBCA04 --description "dual-author agent working on it" 2>/dev/null || true
-gh issue edit "$N" --add-label in-progress
-```
-
-Then move every project board this issue sits on to Status = "In Progress". This is
-NOT conditional on the run being `board`-sourced — discover the issue's project items
-at dispatch so label/search/milestone/issue-number runs update the board too. One
-GraphQL call resolves the item, project, Status-field, and "In Progress" option ids
-per board (an issue can be on several); set `OWNER`/`REPO` once:
-
-```bash
-OWNER=<owner>; REPO=<repo>
-gh api graphql -f owner="$OWNER" -f repo="$REPO" -F num="$N" -f query='
-  query($owner:String!,$repo:String!,$num:Int!){
-    repository(owner:$owner,name:$repo){ issue(number:$num){ projectItems(first:20){ nodes{
-      id
-      project{ id field(name:"Status"){ ... on ProjectV2SingleSelectField { id options{ id name } } } }
-    }}}}}' --jq '
-    .data.repository.issue.projectItems.nodes[] | . as $i
-    | ($i.project.field.options[]? | select(.name|test("In Progress";"i")) | .id) as $opt
-    | select($opt != null) | [$i.id, $i.project.id, $i.project.field.id, $opt] | @tsv' \
-| while IFS=$'\t' read -r ITEM PROJ FIELD OPT; do
-    gh project item-edit --id "$ITEM" --project-id "$PROJ" --field-id "$FIELD" --single-select-option-id "$OPT"
-  done
-```
-
-(If the issue is on no board the loop runs zero times — the label alone covers it.)
+</details>
 
 (No cleanup step needed: the merge closes the issue via `Closes #N`, and board
 automations move closed issues to Done. For PRs that end draft/unmerged, the label
 correctly stays.)
 
-**Concurrency**: default from `monitor.py config dispatch.parallel` (config.toml
-`[dispatch] parallel`, ships at 3) issues in flight; `--parallel <n>` in args overrides
-the config for this run. Spawn up to the cap, queue the rest; when a worker prints its
-verdict, dispatch the next queued issue (create its worktree lazily, at dispatch time).
-
-**Queue file**: the dashboard reads the pending queue live from
-`$BASE/queue.txt` (one issue number per line, dispatch order). Write it
-right after resolving the work list, and rewrite it every time you dispatch a queued
-issue:
-
-```bash
-printf '%s\n' 854 855 > "$BASE/queue.txt"
-# when dispatching 854:
-grep -vx 854 "$BASE/queue.txt" > "$BASE/queue.txt.new" && mv "$BASE/queue.txt.new" "$BASE/queue.txt"
-```
+**Queue file**: `$BASE/queue.txt` (one issue number per line, dispatch order) is the
+single source of pending work. Write it once after resolving the work list; the
+monitor pops entries as it dispatches (with `lifecycle.dispatch = false`, rewrite it
+yourself each time you dispatch, as in the manual block above).
 
 ### 3. Monitoring — shell script, NOT self-re-prompting
 
@@ -292,25 +279,19 @@ python3 ~/.claude/skills/dual-author/scripts/monitor.py wait --seen "$SEEN" 851 
   recent-unwrapped --lines 120` — the worker's agent name now carries icon+phase and
   isn't addressable, so resolve its pane id); if it already scrolled away, get the facts
   from `gh pr view` instead — a merged PR is a finished issue regardless of pane state.
-  Record it, add `verdict-N` to `$SEEN`. Sweep any reviewer panes the worker left open
-  (it should have closed them, but enforce it — closes every non-worker pane in the
-  issue's workspace):
-
-  ```bash
-  python3 ~/.claude/skills/dual-author/scripts/monitor.py close-reviewers N
-  ```
-
-  Then:
-  - **merged** → the tab has served its purpose: drop it from the registry then remove
-    it so a new issue takes its place — `python3
-    ~/.claude/skills/dual-author/scripts/monitor.py unregister N`, then `herdr worktree
-    remove --workspace <ws_id> --force` (removes workspace + checkout), then `git -C
-    <repo> branch -D issue/N 2>/dev/null` (remote branch was deleted by
-    `--delete-branch`). The dashboard drops the row as soon as it's unregistered — no
-    restart needed.
+  Record it, add `verdict-N` to `$SEEN`. Then:
+  - **merged** → the monitor already handled it (config `[lifecycle]`): reviewer panes
+    closed, issue unregistered, worktree workspace removed, local branch deleted, and
+    the next queued issue dispatched into the free slot. Nothing to run — just record
+    the outcome for the final summary. (With `lifecycle.recycle = false`, do it
+    manually: `monitor.py close-reviewers N`, `monitor.py unregister N`,
+    `herdr worktree remove --workspace <ws_id> --force`,
+    `git -C <repo> branch -D issue/N`.)
   - **draft / auto-merge armed** (something failed or checks still pending) → leave the
-    workspace open for inspection (and registered, so it keeps showing on the dashboard).
-  - Either way, dispatch the next queued issue if any.
+    workspace open for inspection (and registered, so it keeps showing on the
+    dashboard). The monitor never recycles an unmerged issue. Sweep stray reviewer
+    panes if any: `monitor.py close-reviewers N`.
+  - With `lifecycle.dispatch = false`, dispatch the next queued issue yourself.
 - `EVENT needs-input <N>` → read the worker's `=== NEEDS INPUT ===` block and print the
   **TL;DR right here** plus `herdr agent focus "$(python3
   ~/.claude/skills/dual-author/scripts/monitor.py worker-pane N)"` to jump there. The user

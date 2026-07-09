@@ -19,6 +19,8 @@ Usage:
   monitor.py config [<a.b.c>]                                print resolved config (all as JSON, or one dotted key)
   monitor.py author-launch --pane <P> --prompt-file <F> [--cwd <D>]
                                                              launch the configured AUTHOR agent (claude|codex) in a pane
+  monitor.py set-root [<path>]                               record the primary checkout path (auto-dispatch/
+                                                             recycle need it; run once at setup, from the repo)
   monitor.py register <N> --workspace <ws> --pane <pane>     record a worker's stable handles (at dispatch)
   monitor.py unregister <N>                                  drop a worker (on recycle/cleanup)
   monitor.py worker-pane <N>                                 print the worker's current pane id (for agent read/focus)
@@ -65,6 +67,17 @@ watch also auto-sweeps reviewer panes (any non-worker pane in a registered issue
 workspace): idle ≥ 3 min → closed (review file is on disk; nobody reads the pane);
 unknown ≥ 10 min → reaped. Workers must treat a vanished reviewer whose review file
 ends with a VERDICT line as a completed round, not a failure.
+
+watch/collect also own the WORKSPACE LIFECYCLE (config [lifecycle], both on by
+default — previously the dispatcher LLM's job, which stalled whenever that session
+was paused/buried): recycle = when an issue's PR is MERGED (gh ground truth), close
+its panes, unregister, remove the worktree workspace, delete the local branch;
+dispatch = when active issues < dispatch.parallel and queue.txt has entries, cut a
+worktree off fresh main, launch the configured author with the issue brief
+($BASE/issue-N-brief.txt if the dispatcher wrote one, else generated from the issue
+title/body), register it, and mark the issue in-progress (label + board Status).
+Requires `set-root` to have been run. Serialized by a lock so two watchers can't
+double-dispatch; a queue head that fails to dispatch 3x is dropped with an event.
 
 --queued (wait mode, optional) lists issues to render as ⏳; wait still requires an
 explicit active list so it can detect missing agents.
@@ -160,6 +173,14 @@ DEFAULTS = {
     # Merge policy for a clean PR (WORKER step 4). enabled=false leaves PRs ready but
     # unmerged for a human to merge.
     "merge": {"enabled": True, "auto": True, "method": "squash", "delete_branch": True},
+    # Deterministic pane/workspace lifecycle, owned by the MONITOR (watch/collect)
+    # instead of the dispatcher LLM — the LLM being paused/buried must not stall
+    # the pipeline. recycle: when an issue's PR is MERGED (gh ground truth, never
+    # pane text), close its reviewer panes, unregister it, remove its worktree
+    # workspace, and delete the local branch. dispatch: when active < dispatch.parallel
+    # and queue.txt is non-empty, create the next issue's worktree, launch the
+    # configured author, register it, and mark the issue in-progress (label+board).
+    "lifecycle": {"recycle": True, "dispatch": True},
     "timeouts": {"reviewer_idle_sweep_secs": 180, "reviewer_unknown_sweep_secs": 600,
                  "codex_down_ttl_secs": 90 * 60, "pr_poll_secs": 60},
 }
@@ -496,6 +517,7 @@ def register(issue, workspace, pane):
                 f.write(r)
         except OSError:
             pass
+    set_root()  # refresh the primary-checkout path when resolvable from cwd
 
 
 def unregister(issue):
@@ -1194,10 +1216,12 @@ def poll_interval():
 
 
 def collect_tick(state, labels, issues_pin=(), queued_pin=()):
-    """One full monitoring tick — shared by legacy `watch` and the curses
-    dashboard's collector thread: discover workers, snapshot (phases, PR, rounds,
-    tails), update timings + activity events, sweep finished reviewer panes, and
-    apply workspace/agent/tab labels. Returns (rows, queued)."""
+    """One full monitoring tick — shared by legacy `watch` and the dashboard's
+    collector process: discover workers, snapshot (phases, PR, rounds, tails),
+    update timings + activity events, sweep finished reviewer panes, and apply
+    workspace/agent/tab labels. Returns (rows, queued). Lifecycle (recycle/
+    dispatch) is NOT here — the caller runs it after publishing the snapshot,
+    so a slow dispatch never delays the dashboard's data."""
     ag = agents()
     active = list(issues_pin) or discover_issues(ag)
     q = list(queued_pin) or read_queue(active)
@@ -1207,6 +1231,243 @@ def collect_tick(state, labels, issues_pin=(), queued_pin=()):
     save_state(state)
     apply_labels(rows, labels)
     return rows, q
+
+
+# ---- lifecycle: monitor-owned recycle + dispatch -----------------------------
+# Previously the dispatcher LLM's event loop recycled merged workspaces and
+# dispatched queued issues — which stalled whenever that session was paused at a
+# usage limit, compacted, or closed. These transitions are deterministic and
+# ground-truth-driven, so the monitor owns them now (config [lifecycle]).
+
+def root_path():
+    return os.path.join(base(), "root.txt")
+
+
+def repo_root():
+    try:
+        with open(root_path()) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def set_root(path=None):
+    """Record the primary checkout's path — auto-dispatch needs it to cut
+    worktrees and delete merged branches from any pane. Called explicitly by
+    the dispatcher at setup and refreshed by register() when resolvable."""
+    p = (path or sh("git", "rev-parse", "--show-toplevel").strip()) or None
+    if p:
+        os.makedirs(base(), exist_ok=True)
+        with open(root_path(), "w") as f:
+            f.write(p)
+    return p
+
+
+def launch_author(pane, prompt_file, cwd):
+    """Run the configured author agent in an existing pane via a launch script
+    (prompt read from file at exec time — immune to typing truncation)."""
+    os.makedirs(base(), exist_ok=True)
+    script = os.path.join(base(), f"launch-worker-{os.getpid()}-{int(time.time())}.sh")
+    quoted = " ".join(shlex.quote(a) for a in author_argv())
+    with open(script, "w") as f:
+        f.write(f'#!/bin/zsh\ncd {shlex.quote(cwd)}\n'
+                f'exec {quoted} "$(cat {shlex.quote(prompt_file)})"\n')
+    os.chmod(script, 0o755)
+    sh("herdr", "pane", "run", pane, script)
+
+
+def _pretrust(path):
+    """Pre-accept trust dialogs for both agents so a fresh worktree doesn't
+    stall the worker at a prompt."""
+    try:
+        p = os.path.expanduser("~/.claude.json")
+        with open(p) as f:
+            d = json.load(f)
+        d.setdefault("projects", {}).setdefault(path, {})["hasTrustDialogAccepted"] = True
+        with open(p, "w") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
+    try:
+        cfgp = os.path.expanduser("~/.codex/config.toml")
+        marker = f'[projects."{path}"]'
+        existing = ""
+        if os.path.exists(cfgp):
+            with open(cfgp) as f:
+                existing = f.read()
+        if marker not in existing:
+            with open(cfgp, "a") as f:
+                f.write(f'\n[projects."{path}"]\ntrust_level = "trusted"\n')
+    except Exception:
+        pass
+
+
+def _mark_in_progress(issue):
+    """Label the issue in-progress and move its project-board items to
+    Status = In Progress (any board it sits on; zero boards is fine)."""
+    repo = _repo()
+    if not repo:
+        return
+    sh("gh", "label", "create", "in-progress", "--repo", repo, "--color", "FBCA04",
+       "--description", "dual-author agent working on it")
+    sh("gh", "issue", "edit", issue, "--repo", repo, "--add-label", "in-progress")
+    owner, name = repo.split("/", 1)
+    query = ('query($owner:String!,$repo:String!,$num:Int!){'
+             'repository(owner:$owner,name:$repo){issue(number:$num){'
+             'projectItems(first:20){nodes{id project{id field(name:"Status")'
+             '{... on ProjectV2SingleSelectField {id options{id name}}}}}}}}}')
+    out = sh("gh", "api", "graphql", "-f", f"owner={owner}", "-f", f"repo={name}",
+             "-F", f"num={issue}", "-f", f"query={query}")
+    try:
+        nodes = json.loads(out)["data"]["repository"]["issue"]["projectItems"]["nodes"]
+    except Exception:
+        return
+    for it in nodes or []:
+        proj = it.get("project") or {}
+        fld = proj.get("field") or {}
+        opt = next((o.get("id") for o in (fld.get("options") or [])
+                    if re.search("in progress", o.get("name") or "", re.I)), None)
+        if opt and it.get("id") and proj.get("id") and fld.get("id"):
+            sh("gh", "project", "item-edit", "--id", it["id"], "--project-id",
+               proj["id"], "--field-id", fld["id"], "--single-select-option-id", opt)
+
+
+def _pop_queue(issue):
+    try:
+        with open(queue_path()) as f:
+            q = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return
+    q = [n for n in q if n.lstrip("#") != str(issue)]
+    tmp = f"{queue_path()}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write("".join(f"{n}\n" for n in q))
+        os.replace(tmp, queue_path())
+    except OSError:
+        pass
+
+
+def _recycle(issue, state):
+    """PR merged (gh ground truth) → the workspace has served its purpose:
+    close leftover reviewer panes, unregister, remove workspace + worktree,
+    delete the local branch (remote was deleted by --delete-branch)."""
+    reg = load_registry()
+    e = reg.get(str(issue)) or {}
+    ws = e.get("ws")
+    ag = agents()
+    wa = _worker_agent(ag, issue, reg)
+    wp = wa.get("pane_id") if wa else None
+    for a in ag.values():
+        if ws and a.get("workspace_id") == ws and a.get("pane_id") != wp:
+            sh("herdr", "pane", "close", a["pane_id"])
+    unregister(issue)
+    if ws:
+        sh("herdr", "worktree", "remove", "--workspace", ws, "--force")
+    root = repo_root()
+    if root:
+        sh("git", "-C", root, "branch", "-D", f"issue/{issue}")
+    _push_event(state, issue, "♻ recycled (PR merged)", time.time())
+
+
+def _dispatch_next(state):
+    """Dispatch the first queued issue: fresh main → worktree workspace →
+    pre-trust → brief (dispatcher-written file, else generated from the issue)
+    → launch author → register → in-progress label/board → startup nudges.
+    Returns True if an issue was dispatched."""
+    root = repo_root()
+    q = read_queue(discover_issues(None))
+    if not root or not q:
+        return False
+    n = q[0].lstrip("#")
+    fails = state.setdefault("_dispatch_fail", {})
+    repo = _repo()
+    sh("git", "-C", root, "fetch", "origin", "main")
+    if sh("git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main":
+        sh("git", "-C", root, "merge", "--ff-only", "origin/main")
+    else:
+        sh("git", "-C", root, "branch", "-f", "main", "origin/main")
+    out = sh("herdr", "worktree", "create", "--cwd", root, "--branch", f"issue/{n}",
+             "--base", "main", "--label", f"issue-{n}", "--no-focus", "--json")
+    try:
+        res = json.loads(out)["result"]
+        ws = res["workspace"]["workspace_id"]
+        wt = res["worktree"]["path"]
+        pane = res["root_pane"]["pane_id"]
+    except Exception:
+        fails[n] = fails.get(n, 0) + 1
+        if fails[n] >= 3:  # persistent failure must not hot-loop the queue head
+            _pop_queue(n)
+            _push_event(state, n, "✗ auto-dispatch failed 3x — dropped from queue "
+                                  "(dispatch manually)", time.time())
+        else:
+            _push_event(state, n, f"auto-dispatch attempt {fails[n]} failed "
+                                  f"(worktree create)", time.time())
+        return False
+    fails.pop(n, None)
+    _pretrust(wt)
+    brief = os.path.join(base(), f"issue-{n}-brief.txt")
+    if not os.path.exists(brief):
+        info = sh("gh", "issue", "view", n, "--repo", repo, "--json", "title,body")
+        try:
+            d = json.loads(info)
+            text = f"{d.get('title', '')}\n\n{d.get('body', '')}"
+        except Exception:
+            text = (f"GitHub issue #{n} in {repo} — brief fetch failed; run "
+                    f"`gh issue view {n}` yourself for the full context.")
+        with open(brief, "w") as f:
+            f.write(text)
+    launch = os.path.join(base(), f"issue-{n}-launch.txt")
+    with open(launch, "w") as f:
+        f.write(f"Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER "
+                f"role exactly. You are in a git worktree on branch issue/{n} for "
+                f"GitHub issue #{n}. Read {brief} for the full issue brief. "
+                f"Base branch: main.\n")
+    launch_author(pane, launch, wt)
+    time.sleep(3)
+    register(n, ws, pane)
+    sh("herdr", "agent", "rename", pane, worker_display(n, "⚙️", "starting"))
+    _pop_queue(n)
+    _push_event(state, n, "⚙ auto-dispatched", time.time())
+    _mark_in_progress(n)
+    # a fresh worktree can stack the security notice + MCP picker dialogs;
+    # spaced Enters clear both (harmless empty submits once the composer is up)
+    for _ in range(3):
+        time.sleep(6)
+        sh("herdr", "pane", "send-keys", pane, "Enter")
+    return True
+
+
+def lifecycle(state, rows):
+    """Monitor-owned lifecycle pass, run AFTER the snapshot is published.
+    Serialized by a machine-local lock so two watchers can't double-dispatch."""
+    lc = cfg()["lifecycle"]
+    if not (lc.get("recycle") or lc.get("dispatch")):
+        return
+    os.makedirs(base(), exist_ok=True)
+    lockf = open(os.path.join(base(), "lifecycle.lock"), "w")
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return  # another watcher owns lifecycle this tick
+        if lc.get("recycle"):
+            reg = load_registry()
+            for r in rows:
+                n = str(r["issue"])
+                if n in reg and pr_merged(n):  # gh ground truth only
+                    _recycle(n, state)
+        if lc.get("dispatch"):
+            cap = int(cfg()["dispatch"]["parallel"])
+            if len(discover_issues(None)) < cap:
+                _dispatch_next(state)  # one per tick keeps ticks bounded
+        save_state(state)
+    finally:
+        if fcntl is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+        lockf.close()
 
 
 def events(rows, seen):
@@ -1226,7 +1487,7 @@ def events(rows, seen):
 
 def main():
     modes = ("watch", "wait", "collect", "review", "ns", "register", "unregister",
-             "worker-pane", "close-reviewers", "config", "author-launch")
+             "worker-pane", "close-reviewers", "config", "author-launch", "set-root")
     if len(sys.argv) < 2 or sys.argv[1] not in modes:
         print(__doc__)
         sys.exit(2)
@@ -1257,15 +1518,20 @@ def main():
         if not opts["pane"] or not opts["prompt-file"]:
             print("author-launch requires --pane and --prompt-file", file=sys.stderr)
             sys.exit(2)
-        os.makedirs(base(), exist_ok=True)
-        script = os.path.join(base(), f"launch-worker-{os.getpid()}.sh")
-        quoted = " ".join(shlex.quote(a) for a in author_argv())
-        with open(script, "w") as f:
-            f.write(f'#!/bin/zsh\ncd {shlex.quote(opts["cwd"])}\n'
-                    f'exec {quoted} "$(cat {shlex.quote(opts["prompt-file"])})"\n')
-        os.chmod(script, 0o755)
-        sh("herdr", "pane", "run", opts["pane"], script)
+        launch_author(opts["pane"], opts["prompt-file"], opts["cwd"])
         print(f"launched author ({cfg()['author']['tool']}) in {opts['pane']}")
+        return
+
+    if mode == "set-root":
+        # set-root [path]: record the primary checkout path (defaults to the
+        # current repo's toplevel). Auto-dispatch/recycle need it to cut
+        # worktrees and delete merged branches from any pane. Dispatcher calls
+        # this once at setup, from the repo.
+        p = set_root(rest[0] if rest else None)
+        if not p:
+            print("set-root: not in a git repo and no path given", file=sys.stderr)
+            sys.exit(1)
+        print(p)
         return
 
     if mode == "ns":
@@ -1366,6 +1632,10 @@ def main():
             state = load_state()
             rows, q = collect_tick(state, labels, issues, queued)
             print("\033[2J\033[H" + render(rows, state, q), flush=True)
+            try:
+                lifecycle(state, rows)
+            except Exception as e:
+                print(f"[dual-author] lifecycle error: {e}", flush=True)
             time.sleep(5)
     elif mode == "collect":
         # Headless data loop for the Textual dashboard, run as a SEPARATE
@@ -1396,6 +1666,12 @@ def main():
                 os.replace(tmp, snap_path)
             except OSError:
                 pass
+            try:
+                lifecycle(state, rows)  # AFTER the snapshot — a slow dispatch
+                # (worktree + launch + nudges) must not delay dashboard data
+            except Exception as e:
+                _push_event(state, "-", f"lifecycle error: {e}", time.time())
+                save_state(state)
             waited = 0
             while waited < poll_interval():  # re-read each second: [p] in the
                 # dashboard changes the cadence mid-sleep (60 → 5 shouldn't

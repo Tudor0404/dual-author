@@ -74,6 +74,20 @@ method        = "squash" # squash | merge | rebase
 delete_branch = true
 
 
+# ── monitor-owned workspace lifecycle ────────────────────────────────────────
+# The watch/collect monitor performs these deterministic transitions itself, so
+# the pipeline keeps moving even when the dispatcher LLM session is paused,
+# compacted, or closed. Both were previously the dispatcher's job.
+[lifecycle]
+recycle  = true   # PR merged (gh ground truth) → close panes, unregister, remove
+                  # the worktree workspace, delete the local branch
+dispatch = true   # active < dispatch.parallel and queue.txt non-empty → cut a
+                  # worktree off fresh main, launch the configured author with the
+                  # issue brief, register, mark the issue in-progress (label+board).
+                  # Needs `monitor.py set-root` run once at setup (from the repo).
+                  # false → the dispatcher dispatches manually as before.
+
+
 # ── monitor timing tunables (rarely need changing) ───────────────────────────
 [timeouts]
 reviewer_idle_sweep_secs    = 180    # idle reviewer pane closed after this
