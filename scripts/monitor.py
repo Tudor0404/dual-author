@@ -156,7 +156,11 @@ DEFAULTS = {
                "extra_args": [], "codex_sandbox": "danger-full-access",
                "codex_approval": "never", "codex_model": "gpt-5.3-codex",
                "codex_effort": "high"},
-    "dispatch": {"parallel": 3},
+    # parallel: issues in flight. respect_dependencies: skip a queued issue while
+    # it still has an OPEN blocker (native GitHub issue dependencies ∪ "blocked by
+    # #N" in the body) and dispatch the next unblocked entry instead — the held
+    # entry stays in queue.txt. Fails open on any gh problem; see open_blockers().
+    "dispatch": {"parallel": 3, "respect_dependencies": True},
     "review": {
         "timeout_mins": 15,
         # The review panel. Order sets split placement (right, down, …). Each entry:
@@ -603,12 +607,38 @@ def pr_merged(issue):
 
 _DEP_CACHE = {}  # issue -> (last_check_ts, [blocking issue numbers as str])
 
+# The body convention for dependencies — ONE parser, two callers: blocked_by()
+# (the dashboard's [g] DAG) and open_blockers() (the dispatch gate). Matches
+# "blocked by #12", "Blocked by: #12", "blocked-by #12", "depends on #12",
+# "requires #12" case-insensitively, several per line, plus a comma/and-separated
+# run after a single keyword ("blocked by #12, #13 and #14").
+DEP_KEY_RE = re.compile(r"(?:blocked[\s._-]*by|depends[\s._-]*on|requires)\s*:?\s*", re.I)
+DEP_REF_RE = re.compile(r"\s*(?:,|;|&|\+|and\b)?\s*#(\d+)", re.I)
+
+
+def deps_in_body(body):
+    """Issue numbers referenced by the 'blocked by #N' body convention — deduped,
+    numeric order. A reference must directly follow the keyword (optionally
+    through ',' / 'and'), so prose like 'blocked by the change in #12' is not a
+    dependency."""
+    found = set()
+    for m in DEP_KEY_RE.finditer(body or ""):
+        pos = m.end()
+        while True:
+            r = DEP_REF_RE.match(body, pos)
+            if not r:
+                break
+            found.add(r.group(1))
+            pos = r.end()
+    return sorted(found, key=int)
+
 
 def blocked_by(issue):
     """Issue numbers this issue is blocked by — GitHub's native issue
     dependencies (REST /dependencies/blocked_by), falling back to 'blocked by
     #N' / 'depends on #N' conventions in the body. Cached 5 min per issue;
-    feeds the dashboard's DAG view."""
+    feeds the dashboard's DAG view. State-agnostic (a closed blocker is still
+    listed) — the dispatch gate needs open-only, see open_blockers()."""
     issue = str(issue).lstrip("#")
     now = time.time()
     ts, deps = _DEP_CACHE.get(issue, (0.0, None))
@@ -626,10 +656,107 @@ def blocked_by(issue):
         if not deps:
             body = sh("gh", "issue", "view", issue, "--repo", repo,
                       "--json", "body", "-q", ".body")
-            deps = sorted({m for m in re.findall(
-                r"(?:blocked.by|depends.on|requires)\s+#(\d+)", body, re.I)}, key=int)
+            deps = deps_in_body(body)
     _DEP_CACHE[issue] = (now, deps)
     return deps
+
+
+# ---- dispatch dependency gate ----------------------------------------------
+# Auto-dispatch pops queue.txt FIFO; without this gate it starts a worker against
+# an unmerged prerequisite, so the branch is cut off a base that lacks what it
+# depends on (conflicts, or an implementation against the wrong contract) and the
+# only defence was hand-gating queue.txt, which no unattended run can do.
+# The gate answers "does this issue have an OPEN blocker?" from BOTH sources and
+# FAILS OPEN on every gh problem: a monitoring convenience must never be able to
+# wedge the pipeline. dispatch.respect_dependencies = false disables it entirely.
+DEP_GATE_TTL = 60          # per-issue cache — the gate runs every dispatch tick
+DEP_GATE_TIMEOUT = 10      # secs per gh call; a hung gh must not stall a tick
+DEP_GATE_TICK_BUDGET = 10  # secs of LIVE lookups per tick; then the scan defers
+
+_GATE_CACHE = {}   # issue -> (last_check_ts, [OPEN blocker numbers as str])
+_STATE_CACHE = {}  # issue -> (last_check_ts, "open"/"closed"/"" unknown)
+_GATE_WARNED = set()  # issues whose lookup already reported a gh failure (log once)
+
+
+def _gh(*args, timeout=DEP_GATE_TIMEOUT):
+    """gh with a hard timeout → (ok, stdout). ok=False on a missing binary, a
+    non-zero exit (unauthenticated, rate-limited, 404 on a repo without the
+    dependencies API) or a timeout — callers read that as "unknown" and fail
+    open. Unlike sh(), which returns "" for both success-with-no-output and
+    failure, this keeps the two apart."""
+    try:
+        r = subprocess.run(("gh",) + args, capture_output=True, text=True,
+                           timeout=timeout)
+    except Exception:  # FileNotFoundError, TimeoutExpired, OSError …
+        return False, ""
+    return (r.returncode == 0), (r.stdout if r.returncode == 0 else "")
+
+
+def _issue_open(issue):
+    """True if <issue> is OPEN. Unknown (gh failed, or the number is a PR rather
+    than an issue) → False, so an unresolvable body reference never holds the
+    queue. Cached DEP_GATE_TTL secs."""
+    issue = str(issue)
+    now = time.time()
+    ts, st = _STATE_CACHE.get(issue, (0.0, None))
+    if st is None or now - ts >= DEP_GATE_TTL:
+        repo = _repo()
+        ok, out = (_gh("issue", "view", issue, "--repo", repo, "--json", "state",
+                       "-q", ".state") if repo else (False, ""))
+        st = out.strip().lower() if ok else ""
+        _STATE_CACHE[issue] = (now, st)
+    return st == "open"
+
+
+def open_blockers(issue, deadline=None, state=None):
+    """OPEN blockers of <issue> — the UNION of GitHub's native issue dependencies
+    (REST .../dependencies/blocked_by, entries whose .state is "open"; there is no
+    GraphQL equivalent) and deps_in_body() references that are still open. []
+    means dispatchable.
+
+    Fails open: gh missing/unauthenticated/rate-limited/timed out, a repo without
+    the dependencies API, unparseable JSON — each unresolved source contributes
+    nothing, and the failure is reported ONCE per issue (activity feed when a
+    `state` is given, else stderr). Cached DEP_GATE_TTL secs per issue.
+    `deadline` bounds live lookups per tick: past it, an uncached issue returns
+    None ("not determined"), which the caller reads as "don't dispatch this one
+    yet" and retries next tick against a warm cache."""
+    issue = str(issue).lstrip("#")
+    now = time.time()
+    ts, blk = _GATE_CACHE.get(issue, (0.0, None))
+    if blk is not None and now - ts < DEP_GATE_TTL:
+        return blk
+    if deadline is not None and now > deadline:
+        return None
+    repo = _repo()
+    blk, failed = [], not repo
+    if repo:
+        ok, out = _gh("api", f"repos/{repo}/issues/{issue}/dependencies/blocked_by",
+                      "--jq", '[.[]|select(.state=="open")|.number]')
+        if ok:
+            try:
+                blk = [str(n) for n in json.loads(out or "[]")]
+            except Exception:
+                failed = True
+        else:
+            failed = True
+        ok, body = _gh("issue", "view", issue, "--repo", repo, "--json", "body",
+                       "-q", ".body")
+        if ok:
+            for d in deps_in_body(body):
+                if d not in blk and _issue_open(d):
+                    blk.append(d)
+        else:
+            failed = True
+    if failed and issue not in _GATE_WARNED:
+        _GATE_WARNED.add(issue)
+        msg = "⚠ dependency check unavailable (gh) — dispatching unguarded"
+        if state is not None:
+            _push_event(state, issue, msg, now)
+        else:
+            sys.stderr.write(f"[dual-author] #{issue}: {msg}\n")
+    _GATE_CACHE[issue] = (now, blk)
+    return blk
 
 
 def rounds_for(issue):
@@ -683,6 +810,34 @@ def read_queue(active):
     return [n for n in q if n not in set(active)]
 
 
+def diff_stats(cwd):
+    """Total lines +added/-removed by the issue branch in its worktree —
+    committed AND uncommitted tracked changes, measured against the merge-base
+    with the default branch. None when unresolvable (no cwd, worktree gone,
+    detached repo state); shown as the +/- column in the dashboard."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    try:
+        for ref in ("origin/HEAD", "origin/main", "origin/master", "main", "master"):
+            mb = _run("git", "-C", cwd, "merge-base", "HEAD", ref, timeout=10)
+            if mb.returncode == 0:
+                break
+        else:
+            return None
+        d = _run("git", "-C", cwd, "diff", "--numstat", mb.stdout.strip(), timeout=10)
+        if d.returncode != 0:
+            return None
+        add = rem = 0
+        for ln in d.stdout.splitlines():
+            cols = ln.split("\t")
+            if len(cols) >= 2 and cols[0].isdigit() and cols[1].isdigit():
+                add += int(cols[0])
+                rem += int(cols[1])
+        return {"add": add, "del": rem}
+    except Exception:
+        return None
+
+
 def snapshot(issues):
     ag = agents()
     reg = load_registry()
@@ -694,7 +849,7 @@ def snapshot(issues):
             rows.append({"issue": n, "status": "missing", "phase": "-",
                          "verdict": pr_merged(n), "input": False,
                          "workspace_id": (reg.get(str(n)) or {}).get("ws"),
-                         "pane_id": None, "tab_id": None,
+                         "pane_id": None, "tab_id": None, "diff": None,
                          "pr": pr_info(n), "rounds": rounds_for(n),
                          "blocked_by": blocked_by(n), "tail": []})
             continue
@@ -725,6 +880,7 @@ def snapshot(issues):
             "workspace_id": a.get("workspace_id"),
             "pane_id": a.get("pane_id"),
             "tab_id": a.get("tab_id"),
+            "diff": diff_stats(a.get("cwd")),
             "pr": pr_info(n),
             "rounds": rounds_for(n),
             "blocked_by": blocked_by(n),
@@ -1046,6 +1202,15 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
         while pending and not failed and time.time() < deadline:
             for slot in list(pending):  # iterate a copy; we mutate pending below
                 p = plan[slot]
+                # The review file is the contract, agent status is only a proxy —
+                # herdr's status tracking can lag minutes behind a finished pane,
+                # so a file already terminated with VERDICT: FAIL decides the slot
+                # (and short-circuits the round) without waiting for the idle flip.
+                if _verdict_of(p["file"]) == "FAIL":
+                    results[slot] = {"file": p["file"], "verdict": "FAIL", "tool": p["tool"]}
+                    pending.remove(slot)
+                    failed = True
+                    break
                 # short idle-poll so the OTHER reviewer's FAIL can interrupt promptly
                 if not _wait_status(p["name"], "idle", 5_000):
                     continue  # still working (or transiently unknown) — re-poll
@@ -1161,7 +1326,7 @@ def render(rows, state, queued=()):
     now = time.time()
     out = [
         f"dual-author — {time.strftime('%H:%M:%S')}",
-        f"{'issue':<9}{'state':<6}{'phase':<22}{'in-phase':<10}total",
+        f"{'issue':<9}{'state':<6}{'phase':<22}{'in-phase':<10}{'total':<9}+/-",
     ]
     for r in rows:
         icon = row_icon(r)
@@ -1169,10 +1334,12 @@ def render(rows, state, queued=()):
         end = st.get("done", now)
         total = fmt_dur(end - st["start"]) if "start" in st else "-"
         in_phase = "-" if "done" in st or "phase_start" not in st else fmt_dur(now - st["phase_start"])
-        out.append(f"#{str(r['issue']):<8}{icon:<5}{r['phase']:<22}{in_phase:<10}{total}")
+        d = r.get("diff")
+        pm = f"+{d['add']}/-{d['del']}" if d else "-"
+        out.append(f"#{str(r['issue']):<8}{icon:<5}{r['phase']:<22}{in_phase:<10}{total:<9}{pm}")
     for i, n in enumerate(queued):
         label = "queued ◀ next" if i == 0 else "queued"
-        out.append(f"#{str(n):<8}{'⏳':<5}{label:<22}{'-':<10}-")
+        out.append(f"#{str(n):<8}{'⏳':<5}{label:<22}{'-':<10}{'-':<9}-")
     return "\n".join(out)
 
 
@@ -1370,25 +1537,93 @@ def _recycle(issue, state):
     _push_event(state, issue, "♻ recycled (PR merged)", time.time())
 
 
+_DEFAULT_BRANCH = None
+
+
+def default_branch(root):
+    """The repo's default branch. Dispatch used to hardcode 'main', which fails
+    outright on repos still on 'master' — there is no origin/main to fetch or
+    branch from. Resolved from the remote once, then cached for the process."""
+    global _DEFAULT_BRANCH
+    if _DEFAULT_BRANCH:
+        return _DEFAULT_BRANCH
+    ref = sh("git", "-C", root, "symbolic-ref", "--short",
+             "refs/remotes/origin/HEAD").strip()
+    if not ref:
+        # origin/HEAD is frequently unset on a clone; ask the remote directly.
+        for line in sh("git", "-C", root, "ls-remote", "--symref",
+                       "origin", "HEAD").splitlines():
+            if line.startswith("ref:"):
+                ref = line.split()[1]
+                break
+    name = ref.rsplit("/", 1)[-1] if ref else ""
+    if not name:
+        for cand in ("main", "master"):
+            if sh("git", "-C", root, "rev-parse", "--verify", "--quiet",
+                  f"refs/remotes/origin/{cand}").strip():
+                name = cand
+                break
+    _DEFAULT_BRANCH = name or "main"
+    return _DEFAULT_BRANCH
+
+
+def _next_dispatchable(state, q):
+    """The first queue entry with no OPEN blocker (dispatch.respect_dependencies).
+    A blocked entry is SKIPPED, never popped — it stays in queue.txt and becomes
+    dispatchable the moment its blockers close, so a whole dependency chain can be
+    queued up front. Returns None when every entry is held (or the tick's lookup
+    budget ran out; the next tick resumes against a warm cache). Each hold is
+    announced once per blocker set in the activity feed."""
+    held = state.setdefault("_dep_held", {})
+    if not cfg()["dispatch"].get("respect_dependencies", True):
+        held.clear()
+        return q[0].lstrip("#")
+    live = {e.lstrip("#") for e in q}
+    for k in [k for k in held if k not in live]:
+        held.pop(k, None)  # left the queue — don't grow the state file forever
+    deadline = time.time() + DEP_GATE_TICK_BUDGET
+    for entry in q:
+        n = entry.lstrip("#")
+        blk = open_blockers(n, deadline, state)
+        if blk is None:
+            return None  # out of lookup budget this tick; resume next tick
+        if blk:
+            sig = ",".join(blk)
+            if held.get(n) != sig:
+                held[n] = sig
+                _push_event(state, n, "⏸ held: blocked by "
+                            + " ".join(f"#{b}" for b in blk), time.time())
+            continue
+        held.pop(n, None)
+        return n
+    return None
+
+
 def _dispatch_next(state):
-    """Dispatch the first queued issue: fresh main → worktree workspace →
-    pre-trust → brief (dispatcher-written file, else generated from the issue)
-    → launch author → register → in-progress label/board → startup nudges.
+    """Dispatch the first dispatchable queued issue (see _next_dispatchable):
+    fresh default branch → worktree workspace → pre-trust → brief
+    (dispatcher-written file, else generated from the issue) → launch author →
+    register → in-progress label/board → startup nudges.
     Returns True if an issue was dispatched."""
     root = repo_root()
     q = read_queue(discover_issues(None))
     if not root or not q:
         return False
-    n = q[0].lstrip("#")
+    n = _next_dispatchable(state, q)
+    if n is None:  # every queued entry is blocked / undetermined this tick
+        return False
     fails = state.setdefault("_dispatch_fail", {})
     repo = _repo()
-    sh("git", "-C", root, "fetch", "origin", "main")
-    if sh("git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main":
-        sh("git", "-C", root, "merge", "--ff-only", "origin/main")
+    # NB: not `base` — that name is the namespace-dir helper, used later in this
+    # same function.
+    base_branch = default_branch(root)
+    sh("git", "-C", root, "fetch", "origin", base_branch)
+    if sh("git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD").strip() == base_branch:
+        sh("git", "-C", root, "merge", "--ff-only", f"origin/{base_branch}")
     else:
-        sh("git", "-C", root, "branch", "-f", "main", "origin/main")
+        sh("git", "-C", root, "branch", "-f", base_branch, f"origin/{base_branch}")
     out = sh("herdr", "worktree", "create", "--cwd", root, "--branch", f"issue/{n}",
-             "--base", "main", "--label", f"issue-{n}", "--no-focus", "--json")
+             "--base", base_branch, "--label", f"issue-{n}", "--no-focus", "--json")
     try:
         res = json.loads(out)["result"]
         ws = res["workspace"]["workspace_id"]
@@ -1422,7 +1657,7 @@ def _dispatch_next(state):
         f.write(f"Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER "
                 f"role exactly. You are in a git worktree on branch issue/{n} for "
                 f"GitHub issue #{n}. Read {brief} for the full issue brief. "
-                f"Base branch: main.\n")
+                f"Base branch: {base_branch}.\n")
     launch_author(pane, launch, wt)
     time.sleep(3)
     register(n, ws, pane)

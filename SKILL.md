@@ -40,7 +40,9 @@ Key sections (see `config.toml` for the annotated full set):
 - `[[review.reviewers]]` — the review panel (any mix/count of codex + claude, each with
   its own model/effort). Default is codex + claude. A codex slot that can't spawn is
   auto-substituted with claude for that round.
-- `[dispatch] parallel` — issues in flight (default 3).
+- `[dispatch]` — `parallel`: issues in flight (default 3). `respect_dependencies`
+  (default true): auto-dispatch skips a queued issue that still has an OPEN blocker and
+  takes the next unblocked entry instead (see *Dependency-aware dispatch* in step 2).
 - `[lifecycle]` — **monitor-owned workspace lifecycle** (both on by default):
   `recycle` = on PR merge (gh ground truth) the monitor closes the issue's panes,
   unregisters it, removes the worktree workspace, and deletes the local branch;
@@ -143,7 +145,8 @@ queue as issues merge and recycle:
 ```bash
 # one brief per issue — title + full body + any context worth passing the worker
 printf '%s\n\n%s\n' "<title>" "<full issue body / context>" > "$BASE/issue-$N-brief.txt"
-# ALL issues go in the queue, dispatch order; the monitor pops it as it dispatches
+# ALL issues go in the queue, preferred order; the monitor pops each as it dispatches
+# (and skips any entry whose blockers are still open — dependency order is safe here)
 printf '%s\n' 851 852 853 854 855 > "$BASE/queue.txt"
 ```
 
@@ -158,7 +161,27 @@ dispatch. `--parallel <n>` in the run's args: write it to the per-repo override
 `dispatch.parallel` issues should appear as ⚙️ rows (the queue drains one per
 monitor tick). If nothing dispatches, check `set-root` was run and the dashboard's
 activity feed for `auto-dispatch failed` events (a queue head that fails 3x is
-dropped with an event — dispatch that issue manually, see below).
+dropped with an event — dispatch that issue manually, see below) or `held: blocked
+by #N` events (every queued issue is waiting on a prerequisite — see below).
+
+**Dependency-aware dispatch** (`[dispatch] respect_dependencies`, default true):
+before dispatching an entry the monitor checks whether the issue still has an OPEN
+blocker, from two sources unioned — GitHub's native issue dependencies (`gh api
+repos/{owner}/{repo}/issues/{N}/dependencies/blocked_by`, entries whose state is
+`open`) and the body convention `blocked by #123` / `Blocked by: #123` /
+`depends on #123` / `requires #123`. A blocked entry is **skipped, not popped**: it
+stays in `queue.txt`, the next unblocked entry dispatches instead, and the held one
+goes automatically on a later tick once its blockers close. So **queue the whole
+dependency chain up front and let the monitor order it** — you do NOT hand-gate
+`queue.txt` for dependencies, and an unattended run can no longer start a worker
+against an unmerged prerequisite (which cuts the branch off a base that lacks what
+it depends on). Each hold is announced once per blocker set in the activity feed as
+`#859 held: blocked by #858`, and the `[g]` graph view shows the same DAG.
+The check **fails open**: if `gh` is missing, unauthenticated, rate-limited, times
+out or answers something unparseable, the issue dispatches anyway and the feed says
+`dependency check unavailable (gh)` once — a monitoring convenience must never wedge
+the pipeline. Results are cached ~60s per issue and only entries actually up for
+dispatch are checked. Set `respect_dependencies = false` for the old strict FIFO.
 
 <details>
 <summary><b>Manual dispatch</b> — only when <code>lifecycle.dispatch = false</code>
@@ -217,8 +240,10 @@ correctly stays.)
 
 **Queue file**: `$BASE/queue.txt` (one issue number per line, dispatch order) is the
 single source of pending work. Write it once after resolving the work list; the
-monitor pops entries as it dispatches (with `lifecycle.dispatch = false`, rewrite it
-yourself each time you dispatch, as in the manual block above).
+monitor pops entries as it dispatches, and leaves in place any entry still blocked by
+an open issue (with `lifecycle.dispatch = false`, rewrite it yourself each time you
+dispatch, as in the manual block above). Top it up at any time — appending to the file
+is enough, dependency-gated entries are safe to add before their blockers merge.
 
 ### 3. Monitoring — shell script, NOT self-re-prompting
 

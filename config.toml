@@ -17,8 +17,10 @@
 
 # ── who IMPLEMENTS each issue (the "main authoring") ─────────────────────────
 [author]
-tool   = "claude"        # "claude" or "codex"
-model  = "opus"          # claude: opus|sonnet|haiku   codex: model slug, or "" for its default
+tool   = "codex"         # "claude" or "codex"
+model  = "opus"          # CLAUDE-ONLY (opus|sonnet|haiku) — dormant while tool="codex";
+                         # codex uses codex_model below (this is only a last-resort
+                         # fallback if codex_model is empty, so don't blank that one)
 effort = "high"          # claude only: low|medium|high (ignored for codex)
 # extra_args = ["--foo"] # appended verbatim to the launch argv (escape hatch)
 
@@ -28,13 +30,35 @@ effort = "high"          # claude only: low|medium|high (ignored for codex)
 # codex_* keys are kept separate from model/effort so they don't clash with claude):
 codex_sandbox  = "danger-full-access"   # or "workspace-write" for network-off, in-tree-only
 codex_approval = "never"                # never | on-request | on-failure | untrusted
-codex_model    = "gpt-5.3-codex"        # latest agentic-coding model (gpt-5.5 = latest general)
+# Probed 2026-07-14 against this machine's login (ChatGPT-plan auth, codex-cli 0.144.4):
+#   available: gpt-5.6-sol / gpt-5.6-luna / gpt-5.6-terra (new 5.6 line), gpt-5.5,
+#   gpt-5.4, gpt-5.4-mini
+#   REJECTED under ChatGPT auth: bare gpt-5.6, every -codex slug (gpt-5.3-codex,
+#   gpt-5.2-codex, gpt-5.1-codex-max/-mini), gpt-5, gpt-5.2, gpt-5.5-pro — API-key auth
+#   may unlock those; on an API key prefer the -codex line for authoring.
+codex_model    = "gpt-5.6-sol"          # owner's pick 2026-07-14 (run at high effort)
 codex_effort   = "high"                 # reasoning effort: minimal | low | medium | high | xhigh
 
 
 # ── how many issues run at once ──────────────────────────────────────────────
 [dispatch]
-parallel = 5             # issues in flight (~3 agents each: 1 worker + 2 reviewers)
+parallel = 6             # issues in flight (~3 agents each: 1 worker + 2 reviewers)
+respect_dependencies = true
+                         # true → auto-dispatch SKIPS a queued issue that still has
+                         # an OPEN blocker and dispatches the next unblocked entry
+                         # instead. Blockers = GitHub's native issue dependencies
+                         # (`gh api .../dependencies/blocked_by`) UNION the body
+                         # convention "blocked by #123" / "Blocked by: #123" /
+                         # "depends on #123" / "requires #123". A held entry STAYS
+                         # in queue.txt (it is never popped) and goes as soon as its
+                         # blockers close, so you can queue a whole dependency chain
+                         # up front instead of hand-gating the file. Each hold shows
+                         # in the dashboard activity feed as "held: blocked by #N".
+                         # Fails OPEN by design: gh missing/unauthenticated/rate-
+                         # limited/timed out → the issue dispatches anyway (with a
+                         # one-off "dependency check unavailable" event), so this
+                         # can never wedge the pipeline.
+                         # false → strict FIFO as before; gate queue.txt yourself.
 
 
 # ── the review panel ─────────────────────────────────────────────────────────
@@ -48,7 +72,9 @@ timeout_mins = 15        # per reviewer, per round
 [[review.reviewers]]
 slot           = "codex"          # stable id used in file/agent names
 tool           = "codex"
-model          = ""               # "" = codex default model
+model          = "gpt-5.6-terra"  # 5.6 mid tier ("Balanced agentic coding model" per
+                                  # `codex debug models`; sol=frontier, luna=fast/cheap)
+codex_effort   = "high"
 codex_sandbox  = "workspace-write"
 codex_approval = "never"
 
@@ -70,6 +96,8 @@ effort = "high"
 [merge]
 enabled       = true     # false → leave the PR marked ready but let a human merge
 auto          = true     # true → `gh pr merge --auto` (merges once all checks pass)
+                         # NB: on a repo with no CI there are no required checks, so
+                         # --auto merges as soon as the PR is mergeable.
 method        = "squash" # squash | merge | rebase
 delete_branch = true
 

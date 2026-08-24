@@ -152,6 +152,16 @@ def checks_text(pr):
     return t
 
 
+def diff_text(r):
+    d = r.get("diff")
+    if not d:
+        return Text("—", "dim")
+    t = Text()
+    t.append(f"+{d.get('add', 0)}", "green")
+    t.append(f" -{d.get('del', 0)}", "red")
+    return t
+
+
 def pr_str(pr):
     if not pr:
         return "—"
@@ -383,7 +393,7 @@ class DualAuthorApp(App):
 
     def on_mount(self):
         t = self.query_one(DataTable)
-        self._cols = t.add_columns("", "issue", "phase", "in-phase", "total", "PR", "checks")
+        self._cols = t.add_columns("", "issue", "phase", "in-phase", "total", "+/-", "PR", "checks")
         self.collector.start()
         self.refresh_data()
         self.set_interval(1.0, self.refresh_data)
@@ -418,12 +428,12 @@ class DualAuthorApp(App):
             in_ph, total = issue_times(state, r["issue"], now)
             desired.append((str(r["issue"]),
                             [row_glyph(r), f"#{r['issue']}", r["phase"], in_ph, total,
-                             pr_str(r.get("pr")), checks_text(r.get("pr"))]))
+                             diff_text(r), pr_str(r.get("pr")), checks_text(r.get("pr"))]))
         for i, n in enumerate(q):
             desired.append((f"q{n}",
                             [Text("…", "dim"), Text(f"#{n}", "dim"),
                              Text("queued ◀ next" if i == 0 else "queued", "dim"),
-                             "", "", "", ""]))
+                             "", "", "", "", ""]))
         current = [row.key.value for row in table.ordered_rows]
         if current == [k for k, _ in desired]:
             # same row set → update cells in place, so scroll and cursor are
