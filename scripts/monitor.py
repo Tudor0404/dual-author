@@ -510,9 +510,22 @@ def _terminal_of(pane):
         return None
 
 
-def register(issue, workspace, pane):
+def branch_for(issue):
+    """The lane's ACTUAL branch — `issue/<N>` unless the lane recorded another.
+
+    A re-dispatched issue cannot always use `issue/<N>`: if an earlier lane already
+    merged a PR from that branch (a split deliverable landing as PR 1 of 2, say), the
+    merge ground truth in `pr_info` finds that old MERGED PR and recycles the fresh
+    lane on its first tick, forever. Dispatch therefore picks a distinct branch in that
+    case and records it here, and every branch-keyed operation reads it back."""
+    e = load_registry().get(str(issue)) or {}
+    return e.get("branch") or f"issue/{issue}"
+
+
+def register(issue, workspace, pane, branch=None):
     reg = load_registry()
-    reg[str(issue)] = {"ws": workspace, "term": _terminal_of(pane), "root_pane": pane}
+    reg[str(issue)] = {"ws": workspace, "term": _terminal_of(pane), "root_pane": pane,
+                       "branch": branch or f"issue/{issue}"}
     save_registry(reg)
     r = _repo()
     if r:  # record owner/repo so panes outside the repo (dashboard) can resolve it
@@ -570,7 +583,7 @@ def pr_info(issue):
         return info
     repo = _repo()
     if repo:
-        out = sh("gh", "pr", "list", "--repo", repo, "--head", f"issue/{issue}",
+        out = sh("gh", "pr", "list", "--repo", repo, "--head", branch_for(issue),
                  "--state", "all", "--limit", "1", "--json",
                  "number,url,state,isDraft,statusCheckRollup")
         try:
@@ -1029,6 +1042,28 @@ def _codex_auth_gate(tool):
             f.close()
 
 
+def _tab_of_pane(pane):
+    """Resolve a pane id to its tab id for `herdr agent start --tab`.
+
+    `--tab` wants a TAB id. Passing a pane id makes herdr answer
+    `agent_placement_not_found` and the slot is recorded SPAWN-FAILED, which
+    reads like host exhaustion but is purely an addressing bug: every reviewer
+    in the round fails identically, including the claude substitution that is
+    supposed to be immune to the codex auth race.
+    """
+    if not pane:
+        return pane
+    try:
+        listing = json.loads(sh("herdr", "pane", "list"))["result"]
+        panes = listing.get("panes", listing)
+        for entry in panes if isinstance(panes, list) else []:
+            if entry.get("pane_id") == pane and entry.get("tab_id"):
+                return entry["tab_id"]
+    except Exception:
+        pass
+    return pane
+
+
 def _spawn_reviewer(name, base_pane, split, cwd, spec, prompt):
     """Spawn one reviewer; return its pane_id or None. Verifies a LIVE agent.
 
@@ -1047,7 +1082,8 @@ def _spawn_reviewer(name, base_pane, split, cwd, spec, prompt):
 
 
 def _spawn_reviewer_inner(name, base_pane, split, cwd, spec, prompt):
-    _run("herdr", "agent", "start", name, "--tab", base_pane, "--split", split,
+    _run("herdr", "agent", "start", name, "--tab", _tab_of_pane(base_pane),
+         "--split", split,
          "--no-focus", "--cwd", cwd, "--", *_build_argv(spec, "review"), prompt)
     for _ in range(6):  # agent start registers the name itself if it worked
         p = _agent_alive(name)
@@ -1528,13 +1564,53 @@ def _recycle(issue, state):
     for a in ag.values():
         if ws and a.get("workspace_id") == ws and a.get("pane_id") != wp:
             sh("herdr", "pane", "close", a["pane_id"])
+    lane_branch = branch_for(issue)  # read BEFORE unregister drops the record
     unregister(issue)
     if ws:
         sh("herdr", "worktree", "remove", "--workspace", ws, "--force")
     root = repo_root()
     if root:
-        sh("git", "-C", root, "branch", "-D", f"issue/{issue}")
+        sh("git", "-C", root, "branch", "-D", lane_branch)
     _push_event(state, issue, "♻ recycled (PR merged)", time.time())
+
+
+def _free_lane_branch(repo, root, n):
+    """A branch name this lane can actually finish on.
+
+    `issue/<N>` is right almost always. It is WRONG when a previous lane for the same
+    issue already merged a PR from it — a deliverable split across two PRs, or any
+    re-dispatch after a partial landing. `pr_info`'s merge ground truth polls by head
+    branch, so that stale MERGED PR makes the monitor declare the fresh lane finished
+    and recycle it seconds after dispatch, on every retry. Observed on a real run: the
+    lane died twice before the branch was changed by hand.
+
+    A leftover local/remote ref is also disqualifying — `worktree create` cannot cut a
+    branch that already exists, and that failure is silent from the queue's side.
+
+    Falls back to plain `issue/<N>` if the checks cannot run (no repo, gh down): a
+    naming convenience must never wedge dispatch."""
+    stem = f"issue/{n}"
+    try:
+        for i in range(1, 12):
+            cand = stem if i == 1 else f"{stem}-r{i}"
+            if root and sh("git", "-C", root, "rev-parse", "--verify", "--quiet",
+                           f"refs/heads/{cand}").strip():
+                continue
+            if root and sh("git", "-C", root, "rev-parse", "--verify", "--quiet",
+                           f"refs/remotes/origin/{cand}").strip():
+                continue
+            if repo:
+                out = sh("gh", "pr", "list", "--repo", repo, "--head", cand,
+                         "--state", "merged", "--limit", "1", "--json", "number")
+                try:
+                    if json.loads(out):
+                        continue
+                except Exception:
+                    pass
+            return cand
+    except Exception:
+        pass
+    return stem
 
 
 _DEFAULT_BRANCH = None
@@ -1622,7 +1698,8 @@ def _dispatch_next(state):
         sh("git", "-C", root, "merge", "--ff-only", f"origin/{base_branch}")
     else:
         sh("git", "-C", root, "branch", "-f", base_branch, f"origin/{base_branch}")
-    out = sh("herdr", "worktree", "create", "--cwd", root, "--branch", f"issue/{n}",
+    lane_branch = _free_lane_branch(repo, root, n)
+    out = sh("herdr", "worktree", "create", "--cwd", root, "--branch", lane_branch,
              "--base", base_branch, "--label", f"issue-{n}", "--no-focus", "--json")
     try:
         res = json.loads(out)["result"]
@@ -1655,12 +1732,13 @@ def _dispatch_next(state):
     launch = os.path.join(base(), f"issue-{n}-launch.txt")
     with open(launch, "w") as f:
         f.write(f"Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER "
-                f"role exactly. You are in a git worktree on branch issue/{n} for "
-                f"GitHub issue #{n}. Read {brief} for the full issue brief. "
+                f"role exactly. You are in a git worktree on branch {lane_branch} for "
+                f"GitHub issue #{n} — wherever the skill says issue/<N>, it means "
+                f"{lane_branch}. Read {brief} for the full issue brief. "
                 f"Base branch: {base_branch}.\n")
     launch_author(pane, launch, wt)
     time.sleep(3)
-    register(n, ws, pane)
+    register(n, ws, pane, lane_branch)
     sh("herdr", "agent", "rename", pane, worker_display(n, "⚙️", "starting"))
     _pop_queue(n)
     _push_event(state, n, "⚙ auto-dispatched", time.time())
@@ -1780,11 +1858,11 @@ def main():
         # stable handles so the dispatcher can resolve it after its display name
         # starts carrying icon+phase. Called once per issue at dispatch.
         issue, args = rest[0].lstrip("#"), rest[1:]
-        opts = {"workspace": None, "pane": None}
+        opts = {"workspace": None, "pane": None, "branch": None}
         while args:
             opts[args[0].lstrip("-")] = args[1]
             args = args[2:]
-        register(issue, opts["workspace"], opts["pane"])
+        register(issue, opts["workspace"], opts["pane"], opts["branch"])
         return
 
     if mode == "unregister":
