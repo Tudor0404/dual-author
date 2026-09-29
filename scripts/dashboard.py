@@ -244,12 +244,26 @@ def dag_text(rows, q, qdeps, state):
     byid = {r["issue"]: r for r in rows}
     blocked = {r["issue"]: [str(d) for d in (r.get("blocked_by") or [])] for r in rows}
     blocked.update({n: [str(d) for d in (qdeps.get(n) or [])] for n in q})
-    children = {}
+    # A DAG is not a tree: an issue with several blockers would be printed once per
+    # blocker, repeating its whole subtree. Give every issue ONE place in the tree —
+    # under the blocker that frees it LAST (its deepest one, which is when it can
+    # actually start) — and name its other blockers inline on that line.
+    inruns = {n: [d for d in blocked.get(n, []) if d in inset] for n in ids}
+
+    def depth(n, stack=()):  # longest blocker chain above n; cycle-safe
+        if n in stack:
+            return 0
+        return 1 + max((depth(d, stack + (n,)) for d in inruns.get(n, [])), default=-1)
+
+    primary = {}
     for n in ids:
-        for d in blocked.get(n, []):
-            if d in inset:
-                children.setdefault(d, []).append(n)
-    roots = [n for n in ids if not any(d in inset for d in blocked.get(n, []))]
+        ds = inruns.get(n) or []
+        if ds:
+            primary[n] = max(ds, key=lambda d: (depth(d), -ids.index(d)))
+    children = {}
+    for n, d in primary.items():
+        children.setdefault(d, []).append(n)
+    roots = [n for n in ids if not inruns.get(n)]
     t = Text()
     t.append("blocking DAG\n", "bold underline")
     if not any(children.values()):
@@ -267,6 +281,9 @@ def dag_text(rows, q, qdeps, state):
             lbl.append(f"  ({total})", "dim")
         else:
             lbl.append("  ⏳ queued", "dim")
+        others = [d for d in inruns.get(n, []) if d != primary.get(n)]
+        if others:
+            lbl.append("   also after " + " ".join(f"#{d}" for d in others), "cyan")
         ext = [d for d in blocked.get(n, []) if d not in inset]
         if ext:
             lbl.append("   ⛓ also blocked by " + " ".join(f"#{d}" for d in ext)
@@ -520,11 +537,21 @@ class DualAuthorApp(App):
 
     def action_focus_worker(self):
         r = self._selected_row()
-        if r and r.get("pane_id"):
-            pane = r["pane_id"]
-            self.run_worker(  # off the UI thread — herdr calls must never block keys
-                lambda: subprocess.run(["herdr", "agent", "focus", pane],
-                                       capture_output=True), thread=True)
+        if not r or not r.get("pane_id"):
+            return
+        # Three steps, outermost first. `herdr agent focus <pane>` moves focus WITHIN the
+        # pane's workspace; on its own it leaves the viewer wherever they were, so Enter
+        # looked like it did nothing from another workspace. Focusing the workspace and
+        # then the tab is what actually navigates the view; each call is a no-op when that
+        # level is already current, and a missing id is simply skipped.
+        steps = [["herdr", "workspace", "focus", r["workspace_id"]] if r.get("workspace_id") else None,
+                 ["herdr", "tab", "focus", r["tab_id"]] if r.get("tab_id") else None,
+                 ["herdr", "agent", "focus", r["pane_id"]]]
+        def go():
+            for cmd in steps:
+                if cmd:
+                    subprocess.run(cmd, capture_output=True)
+        self.run_worker(go, thread=True)  # off the UI thread — herdr calls must never block keys
 
     def action_open_pr(self):
         r = self._selected_row()

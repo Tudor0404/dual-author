@@ -17,6 +17,7 @@ from those. Reviewers stay routed by their per-round spawn names (never renamed)
 Usage:
   monitor.py ns                                              print the resolved namespace and exit
   monitor.py config [<a.b.c>]                                print resolved config (all as JSON, or one dotted key)
+  monitor.py base-branch                                     print the branch lanes are cut from / PRs merge into
   monitor.py author-launch --pane <P> --prompt-file <F> [--cwd <D>]
                                                              launch the configured AUTHOR agent (claude|codex) in a pane
   monitor.py set-root [<path>]                               record the primary checkout path (auto-dispatch/
@@ -160,7 +161,10 @@ DEFAULTS = {
     # it still has an OPEN blocker (native GitHub issue dependencies ∪ "blocked by
     # #N" in the body) and dispatch the next unblocked entry instead — the held
     # entry stays in queue.txt. Fails open on any gh problem; see open_blockers().
-    "dispatch": {"parallel": 3, "respect_dependencies": True},
+    # base_branch: the branch lanes are cut from and PRs merge into; "" = the repo's
+    # default branch. See lane_base().
+    "dispatch": {"parallel": 3, "respect_dependencies": True, "base_branch": "",
+                 "dependency_fail_closed": False},
     "review": {
         "timeout_mins": 15,
         # The review panel. Order sets split placement (right, down, …). Each entry:
@@ -315,6 +319,16 @@ def _config_paths():
         os.path.dirname(os.path.abspath(__file__)), "..", "config.toml"))]
     root = sh("git", "rev-parse", "--show-toplevel").strip()
     if root:
+        # A worker runs in a linked worktree, where an untracked .dual-author.toml
+        # does not exist — it lives only in the primary checkout. Read the primary's
+        # first so a worker resolves the same base_branch/merge policy as the
+        # dispatcher; a file in the worktree itself still wins.
+        common = sh("git", "rev-parse", "--path-format=absolute",
+                    "--git-common-dir").strip()
+        if common and os.path.basename(common) == ".git":
+            primary = os.path.dirname(common)
+            if os.path.realpath(primary) != os.path.realpath(root):
+                paths.append(os.path.join(primary, ".dual-author.toml"))
         paths.append(os.path.join(root, ".dual-author.toml"))
     env = os.environ.get("DUAL_AUTHOR_CONFIG")
     if env:
@@ -377,7 +391,12 @@ def _build_argv(spec, role):
         if model:
             argv += ["-m", model]
         return argv + extra
-    argv = ["claude"]  # claude (default)
+    # launch_prefix replaces the binary: `teamclaude run --auto-fallback --` runs claude
+    # through the pooled-account proxy, which is the only way past a weekly limit on THIS
+    # machine's own Claude account (a bare `claude` then starts, prints "You've hit your
+    # weekly limit", and sits on a dialog — reported as SPAWN-FAILED). The wrapper implies
+    # the claude binary, so the prefix stands in for it rather than preceding it.
+    argv = list(spec.get("launch_prefix") or ["claude"])
     if spec.get("model"):
         argv += ["--model", spec["model"]]
     if spec.get("effort"):
@@ -392,7 +411,11 @@ def author_argv():
 def agents():
     try:
         d = json.loads(sh("herdr", "agent", "list"))
-        return {a.get("name") or "": a for a in d["result"]["agents"]}
+        # herdr 0.9.0 dropped `name` from `agent list`. Keying on name alone collapsed every
+        # agent onto "", so only the LAST survived: workers read as missing, and the reaper
+        # could mistake a worker for a straggler reviewer. Fall back to a unique handle.
+        return {a.get("name") or a.get("pane_id") or a.get("terminal_id") or str(i): a
+                for i, a in enumerate(d["result"]["agents"])}
     except Exception:
         return {}
 
@@ -585,7 +608,7 @@ def pr_info(issue):
     if repo:
         out = sh("gh", "pr", "list", "--repo", repo, "--head", branch_for(issue),
                  "--state", "all", "--limit", "1", "--json",
-                 "number,url,state,isDraft,statusCheckRollup")
+                 "number,url,state,isDraft,baseRefName,statusCheckRollup")
         try:
             lst = json.loads(out)
             if lst:
@@ -604,6 +627,7 @@ def pr_info(issue):
                         pend += 1
                 info = {"number": p.get("number"), "url": p.get("url"),
                         "state": p.get("state"), "draft": p.get("isDraft"),
+                        "base": p.get("baseRefName"),
                         "checks": {"ok": ok, "fail": fail, "pending": pend}}
             else:
                 info = None
@@ -731,6 +755,9 @@ def open_blockers(issue, deadline=None, state=None):
     the dependencies API, unparseable JSON — each unresolved source contributes
     nothing, and the failure is reported ONCE per issue (activity feed when a
     `state` is given, else stderr). Cached DEP_GATE_TTL secs per issue.
+    dispatch.dependency_fail_closed = true inverts that for runs where dispatching
+    over an open blocker is worse than stalling: an unresolved lookup then returns
+    None (undetermined), the tick holds, and nothing is cached.
     `deadline` bounds live lookups per tick: past it, an uncached issue returns
     None ("not determined"), which the caller reads as "don't dispatch this one
     yet" and retries next tick against a warm cache."""
@@ -761,13 +788,22 @@ def open_blockers(issue, deadline=None, state=None):
                     blk.append(d)
         else:
             failed = True
+    fail_closed = bool(cfg()["dispatch"].get("dependency_fail_closed", False))
     if failed and issue not in _GATE_WARNED:
         _GATE_WARNED.add(issue)
-        msg = "⚠ dependency check unavailable (gh) — dispatching unguarded"
+        msg = ("⛔ dependency check unavailable (gh) — holding (fail-closed)"
+               if fail_closed else
+               "⚠ dependency check unavailable (gh) — dispatching unguarded")
         if state is not None:
             _push_event(state, issue, msg, now)
         else:
             sys.stderr.write(f"[dual-author] #{issue}: {msg}\n")
+    if failed and fail_closed and not blk:
+        # dispatch.dependency_fail_closed: a blind gate must not dispatch. Return
+        # "undetermined" (the deadline path's contract) so the caller holds the
+        # tick and retries against a live lookup, and cache nothing — a proxy or
+        # GitHub blip once dispatched three issues over their open blockers.
+        return None
     _GATE_CACHE[issue] = (now, blk)
     return blk
 
@@ -826,12 +862,18 @@ def read_queue(active):
 def diff_stats(cwd):
     """Total lines +added/-removed by the issue branch in its worktree —
     committed AND uncommitted tracked changes, measured against the merge-base
-    with the default branch. None when unresolvable (no cwd, worktree gone,
-    detached repo state); shown as the +/- column in the dashboard."""
+    with the base branch (dispatch.base_branch, else the default branch). None
+    when unresolvable (no cwd, worktree gone, detached repo state); shown as the
+    +/- column in the dashboard."""
     if not cwd or not os.path.isdir(cwd):
         return None
     try:
-        for ref in ("origin/HEAD", "origin/main", "origin/master", "main", "master"):
+        # A lane cut from a non-default base measured against origin/HEAD would
+        # count every commit that base carries over main as the lane's own.
+        pinned = cfg_get("dispatch.base_branch")
+        refs = ((f"origin/{pinned}",) if pinned else ()) + (
+            "origin/HEAD", "origin/main", "origin/master", "main", "master")
+        for ref in refs:
             mb = _run("git", "-C", cwd, "merge-base", "HEAD", ref, timeout=10)
             if mb.returncode == 0:
                 break
@@ -994,9 +1036,19 @@ def _run(*args, timeout=None):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
 
 
+# herdr 0.9.0 no longer resolves `agent get/wait <name>` — only pane ids (and unique
+# names it no longer reports). Reviewers are therefore tracked by the pane id the runner
+# itself created, recorded here at spawn; every name-keyed lookup routes through it.
+_NAME_PANE = {}
+
+
+def _target(name):
+    return _NAME_PANE.get(name, name)
+
+
 def _agent_pane(name):
     try:
-        d = json.loads(sh("herdr", "agent", "get", name))
+        d = json.loads(sh("herdr", "agent", "get", _target(name)))
         return d["result"]["agent"]["pane_id"]
     except Exception:
         return None
@@ -1006,7 +1058,7 @@ def _agent_alive(name):
     """Registered AND actually running (working/idle) — a renamed bare shell is
     'unknown' and does not count."""
     try:
-        d = json.loads(sh("herdr", "agent", "get", name))["result"]["agent"]
+        d = json.loads(sh("herdr", "agent", "get", _target(name)))["result"]["agent"]
         return d["pane_id"] if d.get("agent_status") in ("working", "idle") else None
     except Exception:
         return None
@@ -1082,19 +1134,14 @@ def _spawn_reviewer(name, base_pane, split, cwd, spec, prompt):
 
 
 def _spawn_reviewer_inner(name, base_pane, split, cwd, spec, prompt):
-    _run("herdr", "agent", "start", name, "--tab", _tab_of_pane(base_pane),
-         "--split", split,
-         "--no-focus", "--cwd", cwd, "--", *_build_argv(spec, "review"), prompt)
-    for _ in range(6):  # agent start registers the name itself if it worked
-        p = _agent_alive(name)
-        if p:
-            return p
-        time.sleep(2)
-    # fallback: script-file launch in a fresh pane
+    # herdr 0.9.0 removed `agent start --tab/--split/--cwd` (it now only starts an agent
+    # in an EXISTING pane), so the old primary always failed and cost ~12s before this
+    # path ran. Launch straight into a fresh split via a script file instead.
     try:
         pane = json.loads(sh("herdr", "pane", "split", base_pane, "--direction", split, "--no-focus"))["result"]["pane"]["pane_id"]
     except Exception:
         return None
+    _NAME_PANE[name] = pane  # 0.9.0 cannot resolve the name — track by the pane we made
     os.makedirs(base(), exist_ok=True)
     script = os.path.join(base(), f"launch-{name}.sh")
     with open(script, "w") as f:
@@ -1114,7 +1161,17 @@ def _spawn_reviewer_inner(name, base_pane, split, cwd, spec, prompt):
 
 
 def _wait_status(name, status, timeout_ms):
-    return _run("herdr", "agent", "wait", name, "--status", status, "--timeout", str(timeout_ms)).returncode == 0
+    """True when the agent reaches `status` (a state name, or an iterable of them).
+
+    Several terminal states exist: codex settles on "done" where claude settles on
+    "idle", so waiting on "idle" alone strands a finished codex reviewer until the
+    round's deadline. `--until` repeats, so pass ("idle", "done") to mean either.
+    """
+    # herdr 0.9.0 renamed `--status` to `--until` and only resolves pane-id targets.
+    states = (status,) if isinstance(status, str) else tuple(status)
+    until = [a for s in states for a in ("--until", s)]
+    return _run("herdr", "agent", "wait", _target(name), *until,
+                "--timeout", str(timeout_ms)).returncode == 0
 
 
 def _verdict_of(path):
@@ -1206,19 +1263,6 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                 p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"])
                              or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"]))
         # COLLECT helper: read a finished reviewer's verdict, re-prompt once if absent.
-        def _collect(p):
-            v = _verdict_of(p["file"])
-            if v is None:
-                pane = _agent_pane(p["name"])
-                if pane:
-                    _run("herdr", "pane", "send-text", pane,
-                         f"Your review file {p['file']} is missing or lacks a final VERDICT line. Write it now, ending with VERDICT: PASS or VERDICT: FAIL.")
-                    _run("herdr", "pane", "send-keys", pane, "Enter")
-                    _wait_status(p["name"], "working", 30_000)
-                    _wait_status(p["name"], "idle", (timeout_s // 2) * 1000)
-                    v = _verdict_of(p["file"])
-            return v or "MISSING"
-
         # RUN — poll both reviewers CONCURRENTLY rather than waiting one out fully.
         # The reviewers run in parallel; the moment ONE returns VERDICT: FAIL we
         # cancel the other (close its pane) and return — the author has to fix
@@ -1234,28 +1278,39 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
             else:
                 results[slot] = {"file": p["file"], "verdict": "SPAWN-FAILED", "tool": p["tool"]}
         deadline = time.time() + timeout_s
+        nudge_at = time.time() + timeout_s // 2
         failed = False
         while pending and not failed and time.time() < deadline:
             for slot in list(pending):  # iterate a copy; we mutate pending below
                 p = plan[slot]
-                # The review file is the contract, agent status is only a proxy —
-                # herdr's status tracking can lag minutes behind a finished pane,
-                # so a file already terminated with VERDICT: FAIL decides the slot
-                # (and short-circuits the round) without waiting for the idle flip.
-                if _verdict_of(p["file"]) == "FAIL":
-                    results[slot] = {"file": p["file"], "verdict": "FAIL", "tool": p["tool"]}
+                # THE FILE IS THE ONLY CONTRACT. Agent status is not a usable
+                # terminal signal in EITHER direction, which cost four review rounds
+                # across two lanes on 2026-09-25: herdr reports a codex agent "done"
+                # while it is mid-turn (a reviewer 34s into reading files read as
+                # done), and it can read "idle" between tool calls, so collecting on
+                # a status flip harvests an unwritten file and reports MISSING on a
+                # reviewer that is working normally. So: a written verdict decides the
+                # slot immediately, and nothing else ends it early.
+                v_file = _verdict_of(p["file"])
+                if v_file in ("PASS", "FAIL"):
+                    results[slot] = {"file": p["file"], "verdict": v_file, "tool": p["tool"]}
                     pending.remove(slot)
-                    failed = True
-                    break
-                # short idle-poll so the OTHER reviewer's FAIL can interrupt promptly
-                if not _wait_status(p["name"], "idle", 5_000):
-                    continue  # still working (or transiently unknown) — re-poll
-                v = _collect(p)
-                results[slot] = {"file": p["file"], "verdict": v, "tool": p["tool"]}
-                pending.remove(slot)
-                if v == "FAIL":
-                    failed = True
-                    break
+                    if v_file == "FAIL":
+                        failed = True
+                        break
+                    continue
+                # Nothing written yet. Nudge ONCE at the half-way mark in case the
+                # reviewer finished its analysis without writing the file, then keep
+                # polling — an unwritten slot resolves as MISSING at the deadline, not
+                # before it. A slow reviewer is never cut short.
+                if not p.get("nudged") and time.time() >= nudge_at:
+                    p["nudged"] = True
+                    pane = _agent_pane(p["name"])
+                    if pane:
+                        _run("herdr", "pane", "send-text", pane,
+                             f"Your review file {p['file']} is missing or lacks a final VERDICT line. Write it now, ending with VERDICT: PASS or VERDICT: FAIL.")
+                        _run("herdr", "pane", "send-keys", pane, "Enter")
+            time.sleep(3)  # pace the file poll; the verdict file is checked every pass
         # Resolve whoever is still pending: cancel them on a FAIL short-circuit,
         # otherwise (deadline hit) collect whatever they managed to write.
         for slot in pending:
@@ -1266,7 +1321,11 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                     _run("herdr", "pane", "close", pane)
                 results[slot] = {"file": p["file"], "verdict": "CANCELLED", "tool": p["tool"]}
             else:
-                results[slot] = {"file": p["file"], "verdict": _collect(p), "tool": p["tool"]}
+                # Deadline reached: take whatever is on disk. No status wait, no second
+                # re-prompt — the nudge already happened at the half-way mark.
+                results[slot] = {"file": p["file"],
+                                 "verdict": _verdict_of(p["file"]) or "MISSING",
+                                 "tool": p["tool"]}
     finally:  # CLEAN — unconditional, name-independent (uses tracked pane ids)
         for p in plan.values():
             pane = _agent_pane(p["name"]) or p["pane"]
@@ -1455,10 +1514,30 @@ def repo_root():
 
 
 def set_root(path=None):
-    """Record the primary checkout's path — auto-dispatch needs it to cut
-    worktrees and delete merged branches from any pane. Called explicitly by
-    the dispatcher at setup and refreshed by register() when resolvable."""
-    p = (path or sh("git", "rev-parse", "--show-toplevel").strip()) or None
+    """Record the PRIMARY checkout's path — auto-dispatch needs it to cut
+    worktrees and delete merged branches from any pane.
+
+    Never records a LINKED worktree. `register()` refreshes this, and a worker
+    registers from inside its own lane worktree — so without the guard the
+    dispatcher's root becomes a lane checkout, every later dispatch tries to cut
+    a worktree from inside another worktree, and the queue entries hit
+    `_dispatch_fail: 3` and are silently dropped. Seen twice in one run, with
+    nothing in the activity feed naming the cause.
+
+    In a linked worktree `--git-common-dir` resolves to the primary repo's
+    `.git`, so the primary checkout is its parent. An explicit `path` argument
+    is honoured verbatim — a deliberate dispatcher call outranks the heuristic."""
+    if path:
+        p = path
+    else:
+        p = sh("git", "rev-parse", "--show-toplevel").strip() or None
+        if p:
+            common = sh("git", "rev-parse", "--path-format=absolute",
+                        "--git-common-dir").strip()
+            if common and os.path.basename(common) == ".git":
+                primary = os.path.dirname(common)
+                if primary and os.path.realpath(primary) != os.path.realpath(p):
+                    p = primary  # we were in a linked worktree; use its primary
     if p:
         os.makedirs(base(), exist_ok=True)
         with open(root_path(), "w") as f:
@@ -1472,8 +1551,17 @@ def launch_author(pane, prompt_file, cwd):
     os.makedirs(base(), exist_ok=True)
     script = os.path.join(base(), f"launch-worker-{os.getpid()}-{int(time.time())}.sh")
     quoted = " ".join(shlex.quote(a) for a in author_argv())
+    # `herdr pane run` starts the worker from a fresh pane shell, so nothing in
+    # this process's environment reaches it. A second run against the same repo
+    # needs DUAL_AUTHOR_NS (its own registry/briefs/reviews) and usually its own
+    # DUAL_AUTHOR_CONFIG (e.g. a different base_branch); without these the
+    # worker re-derives the default namespace and reads the primary checkout's
+    # .dual-author.toml, silently joining the OTHER run. Carry them explicitly.
+    exports = "".join(f"export {k}={shlex.quote(os.environ[k])}\n"
+                      for k in ("DUAL_AUTHOR_NS", "DUAL_AUTHOR_CONFIG")
+                      if os.environ.get(k))
     with open(script, "w") as f:
-        f.write(f'#!/bin/zsh\ncd {shlex.quote(cwd)}\n'
+        f.write(f'#!/bin/zsh\n{exports}cd {shlex.quote(cwd)}\n'
                 f'exec {quoted} "$(cat {shlex.quote(prompt_file)})"\n')
     os.chmod(script, 0o755)
     sh("herdr", "pane", "run", pane, script)
@@ -1565,6 +1653,7 @@ def _recycle(issue, state):
         if ws and a.get("workspace_id") == ws and a.get("pane_id") != wp:
             sh("herdr", "pane", "close", a["pane_id"])
     lane_branch = branch_for(issue)  # read BEFORE unregister drops the record
+    _close_off_default(issue, state)
     unregister(issue)
     if ws:
         sh("herdr", "worktree", "remove", "--workspace", ws, "--force")
@@ -1572,6 +1661,33 @@ def _recycle(issue, state):
     if root:
         sh("git", "-C", root, "branch", "-D", lane_branch)
     _push_event(state, issue, "♻ recycled (PR merged)", time.time())
+
+
+def _close_off_default(issue, state):
+    """Close the issue when its PR merged into a NON-default branch.
+
+    GitHub honours "Closes #N" only for merges into the default branch. A lane
+    merged into dispatch.base_branch therefore leaves its issue open, and every
+    dependent stays held by respect_dependencies forever — including dependents
+    in other repos, which read this issue's state through native blocked_by."""
+    info = pr_info(issue) or {}
+    merged_into = info.get("base")
+    root = repo_root()
+    if not merged_into or not root or merged_into == default_branch(root):
+        return
+    repo = _repo()
+    ok, st = _gh("issue", "view", str(issue), "--repo", repo, "--json", "state",
+                 "-q", ".state")
+    if not ok or st.strip().lower() != "open":
+        return
+    note = (f"Merged into `{merged_into}` via #{info.get('number')}. Closed by "
+            f"dual-author: GitHub only auto-closes issues for merges into the "
+            f"default branch.")
+    ok, _ = _gh("issue", "close", str(issue), "--repo", repo, "--reason",
+                "completed", "--comment", note)
+    _push_event(state, issue, (f"✓ closed issue (merged into {merged_into})" if ok
+                               else f"⚠ could not close issue after merge into "
+                                    f"{merged_into} — close it by hand"), time.time())
 
 
 def _free_lane_branch(repo, root, n):
@@ -1643,6 +1759,14 @@ def default_branch(root):
     return _DEFAULT_BRANCH
 
 
+def lane_base(root):
+    """The branch lanes are cut from and PRs merge into: dispatch.base_branch when
+    set (an integration branch developed apart from main), else the default branch.
+    Off the default branch GitHub neither targets PRs there nor closes issues on
+    merge by itself — see _dispatch_next (gh-merge-base) and _close_off_default."""
+    return cfg_get("dispatch.base_branch") or default_branch(root)
+
+
 def _next_dispatchable(state, q):
     """The first queue entry with no OPEN blocker (dispatch.respect_dependencies).
     A blocked entry is SKIPPED, never popped — it stays in queue.txt and becomes
@@ -1692,15 +1816,25 @@ def _dispatch_next(state):
     repo = _repo()
     # NB: not `base` — that name is the namespace-dir helper, used later in this
     # same function.
-    base_branch = default_branch(root)
+    base_branch = lane_base(root)
     sh("git", "-C", root, "fetch", "origin", base_branch)
     if sh("git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD").strip() == base_branch:
         sh("git", "-C", root, "merge", "--ff-only", f"origin/{base_branch}")
     else:
         sh("git", "-C", root, "branch", "-f", base_branch, f"origin/{base_branch}")
+    # `branch -f` refuses a branch checked out in ANY other worktree (an agent's
+    # scratch checkout of an integration branch is common), and --ff-only fails on
+    # a diverged one; either way the local ref is stale and a lane cut from it
+    # starts behind. Cut from the remote-tracking ref whenever they disagree.
+    cut_from = base_branch
+    remote_sha = sh("git", "-C", root, "rev-parse", "--verify", "--quiet",
+                    f"refs/remotes/origin/{base_branch}").strip()
+    if remote_sha and remote_sha != sh("git", "-C", root, "rev-parse", "--verify",
+                                       "--quiet", f"refs/heads/{base_branch}").strip():
+        cut_from = f"origin/{base_branch}"
     lane_branch = _free_lane_branch(repo, root, n)
     out = sh("herdr", "worktree", "create", "--cwd", root, "--branch", lane_branch,
-             "--base", base_branch, "--label", f"issue-{n}", "--no-focus", "--json")
+             "--base", cut_from, "--label", f"issue-{n}", "--no-focus", "--json")
     try:
         res = json.loads(out)["result"]
         ws = res["workspace"]["workspace_id"]
@@ -1718,6 +1852,10 @@ def _dispatch_next(state):
         return False
     fails.pop(n, None)
     _pretrust(wt)
+    # `gh pr create` without --base targets the DEFAULT branch; gh-merge-base is the
+    # per-branch default it reads first, so a worker that omits --base still opens
+    # the PR against the right branch. `git branch -D` at recycle drops it again.
+    sh("git", "-C", root, "config", f"branch.{lane_branch}.gh-merge-base", base_branch)
     brief = os.path.join(base(), f"issue-{n}-brief.txt")
     if not os.path.exists(brief):
         info = sh("gh", "issue", "view", n, "--repo", repo, "--json", "title,body")
@@ -1800,7 +1938,8 @@ def events(rows, seen):
 
 def main():
     modes = ("watch", "wait", "collect", "review", "ns", "register", "unregister",
-             "worker-pane", "close-reviewers", "config", "author-launch", "set-root")
+             "worker-pane", "close-reviewers", "config", "author-launch", "set-root",
+             "base-branch")
     if len(sys.argv) < 2 or sys.argv[1] not in modes:
         print(__doc__)
         sys.exit(2)
@@ -1851,6 +1990,13 @@ def main():
         # Resolved namespace for this repo — SKILL.md uses it to build the
         # matching /tmp/dual-author/<ns> paths.
         print(ns())
+        return
+
+    if mode == "base-branch":
+        # The branch lanes are cut from and PRs merge into (dispatch.base_branch,
+        # else the repo default). Workers use it for --base and review diffs.
+        root = repo_root() or sh("git", "rev-parse", "--show-toplevel").strip()
+        print(lane_base(root))
         return
 
     if mode == "register":

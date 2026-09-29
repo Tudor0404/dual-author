@@ -30,20 +30,32 @@ effort = "high"          # claude only: low|medium|high (ignored for codex)
 # codex_* keys are kept separate from model/effort so they don't clash with claude):
 codex_sandbox  = "danger-full-access"   # or "workspace-write" for network-off, in-tree-only
 codex_approval = "never"                # never | on-request | on-failure | untrusted
+# Owner 2026-09-29: authors run gpt-6-sol, not gpt-6-astra.
 # Probed 2026-07-14 against this machine's login (ChatGPT-plan auth, codex-cli 0.144.4):
 #   available: gpt-5.6-sol / gpt-5.6-luna / gpt-5.6-terra (new 5.6 line), gpt-5.5,
 #   gpt-5.4, gpt-5.4-mini
 #   REJECTED under ChatGPT auth: bare gpt-5.6, every -codex slug (gpt-5.3-codex,
 #   gpt-5.2-codex, gpt-5.1-codex-max/-mini), gpt-5, gpt-5.2, gpt-5.5-pro — API-key auth
 #   may unlock those; on an API key prefer the -codex line for authoring.
-codex_model    = "gpt-5.6-sol"          # owner's pick 2026-07-14 (run at high effort)
-codex_effort   = "high"                 # reasoning effort: minimal | low | medium | high | xhigh
+# Re-probed 2026-09-07 (same login): gpt-6-astra is now listed ("Our most capable
+#   model for complex, demanding work", efforts low..ultra); 5.6 sol/luna/terra, 5.5,
+#   5.4-mini and 5.3-codex-spark still listed.
+codex_model    = "gpt-6-sol"          # owner's pick 2026-09-07 (run at medium effort)
+codex_effort   = "medium"               # reasoning effort: minimal | low | medium | high | xhigh | max | ultra
 
 
 # ── how many issues run at once ──────────────────────────────────────────────
 [dispatch]
 parallel = 6             # issues in flight (~3 agents each: 1 worker + 2 reviewers)
 respect_dependencies = true
+dependency_fail_closed = false
+                         # false (shipped) → an unresolvable gh lookup dispatches the
+                         # issue anyway, so a monitoring blip can never wedge the run.
+                         # true → a blind gate HOLDS the tick instead. Set it per run
+                         # (DUAL_AUTHOR_CONFIG) when dispatching over an open blocker is
+                         # worse than stalling: on 2026-09-24 a proxy blip failed both
+                         # halves of the gate at once and started three issues whose
+                         # prerequisites had not merged.
                          # true → auto-dispatch SKIPS a queued issue that still has
                          # an OPEN blocker and dispatches the next unblocked entry
                          # instead. Blockers = GitHub's native issue dependencies
@@ -59,6 +71,11 @@ respect_dependencies = true
                          # one-off "dependency check unavailable" event), so this
                          # can never wedge the pipeline.
                          # false → strict FIFO as before; gate queue.txt yourself.
+base_branch = ""         # branch lanes are cut from and PRs merge into; "" = the
+                         # repo's default branch. Set it per repo (.dual-author.toml)
+                         # to run an epic on an integration branch. Off the default
+                         # branch the monitor pins each lane's gh-merge-base and
+                         # closes the issue itself on merge (GitHub won't).
 
 
 # ── the review panel ─────────────────────────────────────────────────────────

@@ -118,27 +118,44 @@ via `monitor.py worker-pane $N` (see below). (To run two namespaces for the *sam
 repo, export `DUAL_AUTHOR_NS` before launching and pass it to workers — not needed
 for distinct repos.)
 
-**Sync `main` to `origin/main` ONCE, before the dispatch loop.** `herdr worktree create
---base main` branches off your **local** `main` ref — it does NOT fetch. If local `main`
-is behind the remote, every worktree it cuts starts stale (drives the stale-diff and
-migration-collision failure modes). Fast-forward local `main` from the primary worktree
-first (`--ff-only` so a diverged/dirty `main` fails loudly instead of creating a merge
-commit — resolve by hand if it does):
+**Base branch.** Lanes are cut from, and PRs merge into, the repo's default branch
+unless `[dispatch] base_branch` names another one (an integration branch developed
+apart from `main`). Resolve it once; everything below says `$BASE_BRANCH`:
 
 ```bash
-git -C "$(git rev-parse --show-toplevel)" fetch origin main
-git -C "$(git rev-parse --show-toplevel)" merge --ff-only origin/main \
-  || { echo "local main diverged from origin/main — reconcile before dispatching"; exit 1; }
+BASE_BRANCH=$(python3 ~/.claude/skills/dual-author/scripts/monitor.py base-branch)
 ```
 
-If `main` isn't the currently checked-out branch in the primary worktree, fetch still
-advances the remote-tracking ref; use `git branch -f main origin/main` (only when `main`
-is not checked out anywhere) instead of the `merge --ff-only` above.
+Off the default branch GitHub does two things differently, and the monitor covers
+both: `gh pr create` without `--base` targets the default branch (auto-dispatch sets
+`branch.<lane>.gh-merge-base`, and workers pass `--base`), and "Closes #N" does not
+close the issue on merge (recycle closes it with a comment, so `respect_dependencies`
+releases its dependents, cross-repo ones included).
+
+**Sync `$BASE_BRANCH` to `origin/$BASE_BRANCH` ONCE, before the dispatch loop.**
+`herdr worktree create --base <ref>` branches off that **local** ref — it does NOT
+fetch. If it is behind the remote, every worktree it cuts starts stale (drives the
+stale-diff and migration-collision failure modes). Fast-forward it from the primary
+worktree first (`--ff-only` so a diverged/dirty branch fails loudly instead of
+creating a merge commit — resolve by hand if it does):
+
+```bash
+git -C "$(git rev-parse --show-toplevel)" fetch origin "$BASE_BRANCH"
+git -C "$(git rev-parse --show-toplevel)" merge --ff-only "origin/$BASE_BRANCH" \
+  || { echo "local $BASE_BRANCH diverged from origin — reconcile before dispatching"; exit 1; }
+```
+
+If `$BASE_BRANCH` isn't the currently checked-out branch in the primary worktree, fetch
+still advances the remote-tracking ref; use `git branch -f "$BASE_BRANCH"
+"origin/$BASE_BRANCH"` (only when it is not checked out anywhere) instead of the
+`merge --ff-only` above. Auto-dispatch does this itself, and cuts from
+`origin/$BASE_BRANCH` whenever the local ref could not be synced (e.g. another agent
+has the branch checked out in its own worktree).
 
 **Default flow (`lifecycle.dispatch = true`, the shipped default): you do NOT create
 worktrees or launch workers yourself.** For each issue, write a brief, then queue ALL
 issues and start the dashboard (step 3). The monitor dispatches up to
-`dispatch.parallel` issues itself — worktree off fresh `main`, pre-trust, author
+`dispatch.parallel` issues itself — worktree off fresh `$BASE_BRANCH`, pre-trust, author
 launch, registration, in-progress label + board Status — and back-fills from the
 queue as issues merge and recycle:
 
@@ -192,7 +209,14 @@ For each issue `N`, one command creates the worktree (at
 
 ```bash
 WT_JSON=$(herdr worktree create --cwd "$(git rev-parse --show-toplevel)" \
-  --branch "issue/$N" --base main --label "issue-$N" --no-focus --json)
+  --branch "issue/$N" --base "$BASE_BRANCH" --label "issue-$N" --no-focus --json)
+git config "branch.issue/$N.gh-merge-base" "$BASE_BRANCH"  # gh pr create's default base
+# If issue/$N already exists, or already carries a MERGED PR from an earlier lane
+# (a split deliverable whose PR 1 landed, or any re-dispatch after a partial land),
+# use a distinct name — `issue/$N-r2` — and pass it to `register --branch` below.
+# Auto-dispatch picks this for you via `_free_lane_branch`; do the same by hand here.
+# Reusing a branch whose PR merged makes the monitor read that old PR as this lane's
+# merge ground truth and recycle the lane seconds after it starts, on every retry.
 WS=$(echo "$WT_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["workspace"]["workspace_id"])')
 WT_PATH=$(echo "$WT_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["worktree"]["path"])')
 ROOT_PANE=$(echo "$WT_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
@@ -212,13 +236,13 @@ truncated mid-typing by `pane run`:
 ```bash
 BRIEF="$BASE/issue-$N-brief.txt"   # written in the default-flow step above
 LAUNCH="$BASE/issue-$N-launch.txt"
-printf '%s\n' "Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER role exactly. You are in a git worktree on branch issue/$N for GitHub issue #$N. Read $BRIEF for the full issue brief. Base branch: main." > "$LAUNCH"
+printf '%s\n' "Read ~/.claude/skills/dual-author/SKILL.md and follow the WORKER role exactly. You are in a git worktree on branch issue/$N for GitHub issue #$N. Read $BRIEF for the full issue brief. Base branch: $BASE_BRANCH." > "$LAUNCH"
 python3 ~/.claude/skills/dual-author/scripts/monitor.py author-launch --pane "$ROOT_PANE" --prompt-file "$LAUNCH" --cwd "$WT_PATH"
 # Register against STABLE handles (terminal id + workspace); the agent name is
 # display-only (the dashboard renames it each tick). Resolve the worker later with
 # `monitor.py worker-pane $N`, never by name.
 sleep 3
-python3 ~/.claude/skills/dual-author/scripts/monitor.py register "$N" --workspace "$WS" --pane "$ROOT_PANE"
+python3 ~/.claude/skills/dual-author/scripts/monitor.py register "$N" --workspace "$WS" --pane "$ROOT_PANE" --branch "issue/$N"
 herdr agent rename "$ROOT_PANE" "⚙️ $NS-issue-$N · starting"   # retry once if detection lags
 # A fresh worktree can stack TWO claude startup dialogs (security notice + MCP
 # picker); spaced Enters clear both. Then VERIFY the agent reaches working/idle.
@@ -344,16 +368,22 @@ their cleanup commands (`herdr worktree remove --workspace <id>`), never auto-ru
 
 ## WORKER role
 
-You own one issue, one worktree (your cwd), one workspace. Base branch is `main`. Your
-issue number `<N>` was given in your launch prompt. (Your agent's display name is set by
-the dashboard to `⚙️ <ns>-issue-<N> · <phase>` and changes as you progress — it's
-cosmetic; you never address yourself by it.) Resolve your namespace and temp base once
-(same repo → same `<ns>` the dispatcher used):
+You own one issue, one worktree (your cwd), one workspace. Your base branch is the one
+named in your launch prompt (`Base branch: <name>`) — usually `main`, but a run can
+target an integration branch instead, and then `main` is the WRONG base for your PR and
+your review diffs. Your issue number `<N>` was given in your launch prompt. (Your agent's
+display name is set by the dashboard to `⚙️ <ns>-issue-<N> · <phase>` and changes as you
+progress — it's cosmetic; you never address yourself by it.) Resolve your namespace,
+temp base and base branch once (same repo → same `<ns>` the dispatcher used):
 
 ```bash
 NS=$(python3 ~/.claude/skills/dual-author/scripts/monitor.py ns)
 BASE="/tmp/dual-author/$NS"; mkdir -p "$BASE"
+BASE_BRANCH=$(python3 ~/.claude/skills/dual-author/scripts/monitor.py base-branch)
+# must equal the `Base branch:` in your launch prompt — if not, trust the launch prompt
 ```
+
+Wherever this role says `<base>`, substitute that branch name literally.
 
 Use `$BASE/...` for every temp path below. The review runner auto-namespaces its own
 output dirs and reviewer agent names, so `monitor.py review <N> ...` needs no ns flag.
@@ -403,7 +433,7 @@ Implement the issue. Commit on the `issue/<N>` branch with a descriptive message
 
 ```bash
 git push -u origin "issue/<N>"
-gh pr create --draft --title "<issue title> (#<N>)" --body "Closes #<N>. Dual-authored: implementation + codex/claude review loop in progress." 
+gh pr create --draft --base "$BASE_BRANCH" --title "<issue title> (#<N>)" --body "Closes #<N>. Dual-authored: implementation + codex/claude review loop in progress." 
 PR=$(gh pr view --json number -q .number)
 ```
 
@@ -431,7 +461,7 @@ Write your review prompt to a file (it must NOT contain the "write your review t
 ```bash
 RD="$BASE/issue-<N>"; mkdir -p "$RD"
 cat > "$RD/r<k>-prompt.txt" <<'PROMPT'
-Review the diff of this branch against main (git diff main...HEAD) for correctness
+Review the diff of this branch against <base> (git diff origin/<base>...HEAD) for correctness
 bugs, security issues, and missed requirements of issue #<N>: <title>. Be specific,
 file:line per finding.
 PROMPT
@@ -502,7 +532,7 @@ for NEW bugs your fixes introduced. Each round reviews the full current diff col
 Re-run the relevant unit and integration tests first — fixes break tests as easily as
 the original implementation did; don't spawn a round on a diff that fails its own tests.
 Then run the round-k review with the SAME state-machine command as step 2 — a new tag
-(`r<k>`), same prompt file content, full diff (`git diff main...HEAD`), no mention of
+(`r<k>`), same prompt file content, full diff (`git diff origin/<base>...HEAD`), no mention of
 previous rounds, no summary of what you fixed: they must find problems independently.
 The runner handles spawn/wait/collect/close — there is no manual sweep step anymore.
 Stop when both fresh reviewers pass or remaining findings are only false positives.
