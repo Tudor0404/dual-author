@@ -16,12 +16,22 @@
 
 
 # ── who IMPLEMENTS each issue (the "main authoring") ─────────────────────────
+# Owner 2026-09-30: authoring moves to Opus 5.5. Reviewing is unchanged — codex
+# gpt-5.6-terra + claude claude-sonnet-5-5 (owner 2026-09-29).
 [author]
-tool   = "codex"         # "claude" or "codex"
-model  = "opus"          # CLAUDE-ONLY (opus|sonnet|haiku) — dormant while tool="codex";
-                         # codex uses codex_model below (this is only a last-resort
-                         # fallback if codex_model is empty, so don't blank that one)
-effort = "high"          # claude only: low|medium|high (ignored for codex)
+tool   = "claude"        # "claude" or "codex"
+model  = "claude-opus-5-5"
+# effort MUST stay empty, not absent: DEFAULTS carries "high", and `--effort high`
+# makes the installed claude CLI behind the teamclaude wrapper exit instantly
+# (verified — the same command without it answers). Removing the key here lets the
+# default through and every lane dies at spawn.
+effort = ""
+# launch_prefix REPLACES the binary (the wrapper implies claude). Bare `claude`
+# draws on THIS machine's own account, which is weekly-limited — it starts, prints
+# "You've hit your weekly limit" and sits on a dialog, reported as SPAWN-FAILED.
+# The pooled wrapper is the only route past that, and it is what the claude
+# reviewer slot has been using all along.
+launch_prefix = ["teamclaude", "run", "--auto-fallback", "--"]
 # extra_args = ["--foo"] # appended verbatim to the launch argv (escape hatch)
 
 # codex-as-author needs to push, call gh, run dev tools — so it authors with a
@@ -96,10 +106,10 @@ codex_sandbox  = "workspace-write"
 codex_approval = "never"
 
 [[review.reviewers]]
-slot   = "claude"
-tool   = "claude"
-model  = "sonnet"                 # opus while its weekly cap has headroom; sonnet is the safe default
-effort = "high"
+slot          = "claude"
+tool          = "claude"
+model         = "sonnet"                 # opus while its weekly cap has headroom; sonnet is the safe default
+launch_prefix = ["teamclaude", "run", "--auto-fallback", "--"]
 
 # Example — a third reviewer, or an all-claude panel (comment out the codex one):
 # [[review.reviewers]]
