@@ -1666,6 +1666,55 @@ def _recycle(issue, state):
                 else "♻ recycled (PR merged)", time.time())
 
 
+REQUEUE_GRACE_SECS = 300  # GitHub's auto-close lands ~50s after a merge; wait well
+                          # past that before deciding an issue was left open on purpose
+
+
+def _drain_requeue_pending(state):
+    """Decide the parked requeues from `_requeue_if_still_open` on settled state.
+
+    An entry is parked when the merged PR carried a closing keyword, which means the
+    issue MIGHT close by itself. After REQUEUE_GRACE_SECS, whatever GitHub did is what
+    it meant: still open -> the issue really does have work left, so requeue it;
+    closed -> drop it. Either way the entry leaves the pending map, so nothing
+    accumulates and no issue is examined twice.
+
+    An issue that has since been dispatched again is dropped without requeuing —
+    otherwise it would sit in queue.txt while its own lane runs."""
+    pending = state.get("_requeue_pending") or {}
+    if not pending:
+        return
+    repo = _repo()
+    now = time.time()
+    active = set(load_registry())
+    for n, parked in list(pending.items()):
+        if now - parked < REQUEUE_GRACE_SECS:
+            continue
+        if n in active:
+            pending.pop(n, None)
+            continue
+        ok, st = _gh("issue", "view", n, "--repo", repo, "--json", "state", "-q", ".state")
+        if not ok:
+            continue  # leave parked and retry next tick rather than guess
+        pending.pop(n, None)
+        if st.strip().lower() != "open":
+            continue
+        try:
+            with open(queue_path()) as f:
+                q = [ln.strip().lstrip("#") for ln in f if ln.strip()]
+        except OSError:
+            q = []
+        if n in q:
+            continue
+        try:
+            with open(queue_path(), "a") as f:
+                f.write(n + "\n")
+        except OSError:
+            continue
+        _PR_CACHE.pop(n, None)
+        _push_event(state, n, "↩ requeued (PR merged, issue left open)", now)
+
+
 def _merged_pr_autocloses(issue):
     """True when this lane's merged PR will close the issue BY ITSELF, shortly.
 
@@ -1728,9 +1777,17 @@ def _requeue_if_still_open(issue, state):
                  "-q", ".state")
     if not ok or st.strip().lower() != "open":
         return False
-    if _merged_pr_autocloses(issue):
-        return False  # reads OPEN only because GitHub has not caught up yet
     n = str(issue)
+    if _merged_pr_autocloses(issue):
+        # A closing keyword is a REASON TO WAIT, never a decision. GitHub acts
+        # asynchronously (~50s), so requeuing now would cut a phantom lane — but it
+        # also sometimes does not act at all: PR #1899 merged into main at 13:51:26Z
+        # with "Closes #1747." and GitHub logged only a `referenced` event, never a
+        # `closed` one, leaving #1747 open with an unchecked box and out of the queue.
+        # Suppressing on the keyword alone traded one leak for another. So park it and
+        # let a later tick decide on the state GitHub actually settled on.
+        state.setdefault("_requeue_pending", {})[n] = time.time()
+        return False
     try:
         with open(queue_path()) as f:
             q = [ln.strip().lstrip("#") for ln in f if ln.strip()]
@@ -1998,6 +2055,7 @@ def lifecycle(state, rows):
                 n = str(r["issue"])
                 if n in reg and pr_merged(n):  # gh ground truth only
                     _recycle(n, state)
+        _drain_requeue_pending(state)
         if lc.get("dispatch"):
             cap = int(cfg()["dispatch"]["parallel"])
             if len(discover_issues(None)) < cap:
