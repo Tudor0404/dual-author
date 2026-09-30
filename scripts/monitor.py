@@ -1654,13 +1654,57 @@ def _recycle(issue, state):
             sh("herdr", "pane", "close", a["pane_id"])
     lane_branch = branch_for(issue)  # read BEFORE unregister drops the record
     _close_off_default(issue, state)
+    requeued = _requeue_if_still_open(issue, state)
     unregister(issue)
     if ws:
         sh("herdr", "worktree", "remove", "--workspace", ws, "--force")
     root = repo_root()
     if root:
         sh("git", "-C", root, "branch", "-D", lane_branch)
-    _push_event(state, issue, "♻ recycled (PR merged)", time.time())
+    _push_event(state, issue,
+                "♻ recycled (PR merged, requeued — issue still open)" if requeued
+                else "♻ recycled (PR merged)", time.time())
+
+
+def _requeue_if_still_open(issue, state):
+    """A merged PR does not mean the issue is finished.
+
+    A PHASED issue ships several PRs ("Part of #N", not "Closes #N"): each one
+    merges into the default branch, GitHub leaves the issue open on purpose, and
+    the next phase is still owed. Recycling on pr_merged alone therefore tore the
+    lane down and dropped the issue from queue.txt for good — it stayed open with
+    unchecked acceptance criteria and went on holding every dependent through
+    respect_dependencies, with nothing left in the queue to clear it. That is how
+    #1765/#1796/#1798/#1808 came to gate 20 queued issues while the fleet idled at
+    4 of 10 lanes with a 29-entry queue.
+
+    So: recycle the workspace either way (its branch is merged and its worktree is
+    spent), but put a still-open issue BACK on the queue so the next tick can cut a
+    fresh lane for its next phase. Returns True when it was requeued.
+
+    Fails safe: any unresolved `gh` state leaves the queue untouched, because
+    requeuing an issue that is actually closed would loop the lane forever."""
+    repo = _repo()
+    if not repo:
+        return False
+    ok, st = _gh("issue", "view", str(issue), "--repo", repo, "--json", "state",
+                 "-q", ".state")
+    if not ok or st.strip().lower() != "open":
+        return False
+    n = str(issue)
+    try:
+        with open(queue_path()) as f:
+            q = [ln.strip().lstrip("#") for ln in f if ln.strip()]
+    except OSError:
+        q = []
+    if n in q:
+        return False
+    try:
+        with open(queue_path(), "a") as f:
+            f.write(n + "\n")
+    except OSError:
+        return False
+    return True
 
 
 def _close_off_default(issue, state):
