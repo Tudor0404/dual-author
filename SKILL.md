@@ -43,6 +43,8 @@ Key sections (see `config.toml` for the annotated full set):
 - `[dispatch]` — `parallel`: issues in flight (default 3). `respect_dependencies`
   (default true): auto-dispatch skips a queued issue that still has an OPEN blocker and
   takes the next unblocked entry instead (see *Dependency-aware dispatch* in step 2).
+  `skip_labels` (default `epic`, `owner-step`): a queued issue carrying one, a PR, or
+  a closed issue is popped and never dispatched.
 - `[lifecycle]` — **monitor-owned workspace lifecycle** (both on by default):
   `recycle` = on PR merge (gh ground truth) the monitor closes the issue's panes,
   unregisters it, removes the worktree workspace, and deletes the local branch;
@@ -76,14 +78,20 @@ Args can be any of:
 - **Issue numbers**: `/dual-author 12 34`
 - **A project board**: `/dual-author board <name-or-number>` or natural language like
   "everything in the Sprint 3 board" → `gh project list --owner <owner>` to find it,
-  then `gh project item-list <number> --owner <owner> --format json`; take open issues,
-  optionally filtered by a status column the user names (e.g. "Todo").
+  then `gh project item-list <number> --owner <owner> --format json --limit 1000` (the
+  default is 30); take open issues, optionally filtered by a status column the user
+  names (e.g. "Todo"). A board spans repos, and a queued bare number resolves in the
+  current repo, so keep only items whose `content.repository` is this run's owner/repo
+  (`gh repo view --json nameWithOwner -q .nameWithOwner`). Skip issues labelled
+  `epic` or `owner-step` (`dispatch.skip_labels`; the monitor also pops any that
+  reach the queue).
 - **A label or milestone**: `gh issue list --label X` / `--milestone X`.
 - **No args**: `gh issue list --state open --limit 20` and ask which to dispatch
   (AskUserQuestion, multiSelect).
 
 Before spawning, show the resolved list (count + titles) and confirm — the user should
-see the blast radius first.
+see the blast radius first. For a board, also state how many items were skipped (other
+repos, `epic`/`owner-step`).
 
 Gather context for each: `gh issue view <N> --json title,body,labels`.
 
@@ -199,6 +207,12 @@ out or answers something unparseable, the issue dispatches anyway and the feed s
 `dependency check unavailable (gh)` once — a monitoring convenience must never wedge
 the pipeline. Results are cached ~60s per issue and only entries actually up for
 dispatch are checked. Set `respect_dependencies = false` for the old strict FIFO.
+
+**Skip guard** (`[dispatch] skip_labels`, always on): before the blocker check, an
+entry labelled `epic`/`owner-step`, a PR number, or a closed issue is **popped** with
+`#N skipped: labelled epic (not for dual-author)` (or the PR/closed reason) in the
+feed. Same cache and fail-open rule as the blocker check (`label check unavailable
+(gh)` once).
 
 <details>
 <summary><b>Manual dispatch</b> — only when <code>lifecycle.dispatch = false</code>

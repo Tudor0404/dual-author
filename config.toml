@@ -86,6 +86,16 @@ base_branch = ""         # branch lanes are cut from and PRs merge into; "" = th
                          # to run an epic on an integration branch. Off the default
                          # branch the monitor pins each lane's gh-merge-base and
                          # closes the issue itself on merge (GitHub won't).
+skip_labels = ["epic", "owner-step"]
+                         # a queued issue carrying any of these labels is POPPED
+                         # from queue.txt, never dispatched, with one feed line
+                         # "#N skipped: labelled <label> (not for dual-author)". A
+                         # queued PR number or CLOSED issue is popped the same way.
+                         # Checked at dispatch whatever respect_dependencies says
+                         # (one `gh api repos/{R}/issues/{N}`, cached 60s); a gh
+                         # failure fails open like the blocker check (dispatches,
+                         # says so once) unless dependency_fail_closed = true.
+                         # [] disables the label half; PRs/closed are always skipped.
 
 
 # ── the review panel ─────────────────────────────────────────────────────────

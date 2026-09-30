@@ -162,9 +162,11 @@ DEFAULTS = {
     # #N" in the body) and dispatch the next unblocked entry instead — the held
     # entry stays in queue.txt. Fails open on any gh problem; see open_blockers().
     # base_branch: the branch lanes are cut from and PRs merge into; "" = the repo's
-    # default branch. See lane_base().
+    # default branch. See lane_base(). skip_labels: a queued issue carrying one is
+    # popped, never dispatched (as is a PR or a CLOSED issue); see skip_reason().
     "dispatch": {"parallel": 3, "respect_dependencies": True, "base_branch": "",
-                 "dependency_fail_closed": False},
+                 "dependency_fail_closed": False,
+                 "skip_labels": ["epic", "owner-step"]},
     "review": {
         "timeout_mins": 15,
         # The review panel. Order sets split placement (right, down, …). Each entry:
@@ -806,6 +808,72 @@ def open_blockers(issue, deadline=None, state=None):
         return None
     _GATE_CACHE[issue] = (now, blk)
     return blk
+
+
+# ---- dispatch skip guard ---------------------------------------------------
+# A board spans epics and owner-only steps, and a queue fed from it can carry
+# them; dispatching one puts an agent on work that is not a lane (an epic) or
+# not an agent's to do (an owner-step). dispatch.skip_labels names those
+# labels. A queued entry carrying one, a PR number, or a CLOSED issue is POPPED
+# (unlike a blocked entry, it will never become dispatchable) with one feed
+# line. Same caching, tick budget and fail-open contract as open_blockers():
+# a gh failure dispatches as before and says so once per issue;
+# dispatch.dependency_fail_closed makes a blind lookup hold the tick instead.
+_META_CACHE = {}      # issue -> (last_check_ts, {"labels","state","pr"}; {} unknown)
+_META_WARNED = set()  # issues whose lookup already reported a gh failure
+
+
+def skip_reason(issue, deadline=None, state=None):
+    """Why <issue> must not be dispatched ("labelled epic (not for dual-author)",
+    a PR, not open) → str; "" when it may go; None when undetermined (tick
+    budget spent on a cold cache, or a blind lookup under
+    dependency_fail_closed). One `gh api repos/{R}/issues/{N}` call, cached
+    DEP_GATE_TTL secs."""
+    issue = str(issue).lstrip("#")
+    now = time.time()
+    ts, meta = _META_CACHE.get(issue, (0.0, None))
+    if meta is None or now - ts >= DEP_GATE_TTL:
+        if deadline is not None and now > deadline:
+            return None
+        repo = _repo()
+        ok, out = (_gh("api", f"repos/{repo}/issues/{issue}", "--jq",
+                       "{labels:[.labels[].name],state:.state,"
+                       "pr:(.pull_request != null)}") if repo else (False, ""))
+        meta = {}
+        if ok:
+            try:
+                d = json.loads(out)
+                meta = {"labels": [str(x) for x in d.get("labels") or []],
+                        "state": str(d.get("state") or "").lower(),
+                        "pr": bool(d.get("pr"))}
+            except Exception:
+                meta = {}
+        if not meta:
+            fail_closed = bool(cfg()["dispatch"].get("dependency_fail_closed", False))
+            if issue not in _META_WARNED:
+                _META_WARNED.add(issue)
+                msg = ("⛔ label check unavailable (gh): holding (fail-closed)"
+                       if fail_closed else
+                       "⚠ label check unavailable (gh): dispatching unguarded")
+                if state is not None:
+                    _push_event(state, issue, msg, now)
+                else:
+                    sys.stderr.write(f"[dual-author] #{issue}: {msg}\n")
+            if fail_closed:
+                return None  # cache nothing; retry live next tick
+        _META_CACHE[issue] = (now, meta)
+    if not meta:
+        return ""  # unknown → fail open
+    if meta["pr"]:
+        return "is a pull request, not an issue (not for dual-author)"
+    if meta["state"] and meta["state"] != "open":
+        return f"issue is {meta['state']} (nothing to dispatch)"
+    skip = cfg()["dispatch"].get("skip_labels") or []
+    skip = {str(s).casefold() for s in ([skip] if isinstance(skip, str) else skip)}
+    hit = [lb for lb in meta["labels"] if lb.casefold() in skip]
+    if hit:
+        return f"labelled {', '.join(hit)} (not for dual-author)"
+    return ""
 
 
 def rounds_for(issue):
@@ -1919,17 +1987,30 @@ def _next_dispatchable(state, q):
     dispatchable the moment its blockers close, so a whole dependency chain can be
     queued up front. Returns None when every entry is held (or the tick's lookup
     budget ran out; the next tick resumes against a warm cache). Each hold is
-    announced once per blocker set in the activity feed."""
+    announced once per blocker set in the activity feed.
+    Before the blocker check, and whatever respect_dependencies says, the skip
+    guard (skip_reason: dispatch.skip_labels, a PR, a CLOSED issue) POPS an
+    entry that must never dispatch, with one feed line."""
     held = state.setdefault("_dep_held", {})
-    if not cfg()["dispatch"].get("respect_dependencies", True):
+    deps = cfg()["dispatch"].get("respect_dependencies", True)
+    if not deps:
         held.clear()
-        return q[0].lstrip("#")
     live = {e.lstrip("#") for e in q}
     for k in [k for k in held if k not in live]:
         held.pop(k, None)  # left the queue — don't grow the state file forever
     deadline = time.time() + DEP_GATE_TICK_BUDGET
     for entry in q:
         n = entry.lstrip("#")
+        why = skip_reason(n, deadline, state)
+        if why is None:
+            return None  # out of lookup budget, or a blind fail-closed lookup
+        if why:
+            _pop_queue(n)
+            held.pop(n, None)
+            _push_event(state, n, f"skipped: {why}", time.time())
+            continue
+        if not deps:
+            return n
         blk = open_blockers(n, deadline, state)
         if blk is None:
             return None  # out of lookup budget this tick; resume next tick
