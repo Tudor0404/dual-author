@@ -86,7 +86,7 @@ base_branch = ""         # branch lanes are cut from and PRs merge into; "" = th
                          # to run an epic on an integration branch. Off the default
                          # branch the monitor pins each lane's gh-merge-base and
                          # closes the issue itself on merge (GitHub won't).
-skip_labels = ["epic", "owner-step"]
+skip_labels = ["epic", "owner-step", "manual", "parked"]
                          # a queued issue carrying any of these labels is POPPED
                          # from queue.txt, never dispatched, with one feed line
                          # "#N skipped: labelled <label> (not for dual-author)". A

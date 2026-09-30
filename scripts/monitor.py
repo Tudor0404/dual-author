@@ -166,7 +166,7 @@ DEFAULTS = {
     # popped, never dispatched (as is a PR or a CLOSED issue); see skip_reason().
     "dispatch": {"parallel": 3, "respect_dependencies": True, "base_branch": "",
                  "dependency_fail_closed": False,
-                 "skip_labels": ["epic", "owner-step"]},
+                 "skip_labels": ["epic", "owner-step", "manual", "parked"]},
     "review": {
         "timeout_mins": 15,
         # The review panel. Order sets split placement (right, down, …). Each entry:

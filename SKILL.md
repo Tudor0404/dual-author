@@ -43,7 +43,7 @@ Key sections (see `config.toml` for the annotated full set):
 - `[dispatch]` — `parallel`: issues in flight (default 3). `respect_dependencies`
   (default true): auto-dispatch skips a queued issue that still has an OPEN blocker and
   takes the next unblocked entry instead (see *Dependency-aware dispatch* in step 2).
-  `skip_labels` (default `epic`, `owner-step`): a queued issue carrying one, a PR, or
+  `skip_labels` (default `epic`, `owner-step`, `manual`, `parked`): a queued issue carrying one, a PR, or
   a closed issue is popped and never dispatched.
 - `[lifecycle]` — **monitor-owned workspace lifecycle** (both on by default):
   `recycle` = on PR merge (gh ground truth) the monitor closes the issue's panes,
@@ -82,9 +82,9 @@ Args can be any of:
   default is 30); take open issues, optionally filtered by a status column the user
   names (e.g. "Todo"). A board spans repos, and a queued bare number resolves in the
   current repo, so keep only items whose `content.repository` is this run's owner/repo
-  (`gh repo view --json nameWithOwner -q .nameWithOwner`). Skip issues labelled
-  `epic` or `owner-step` (`dispatch.skip_labels`; the monitor also pops any that
-  reach the queue).
+  (`gh repo view --json nameWithOwner -q .nameWithOwner`). Skip issues carrying a
+  `dispatch.skip_labels` label (`epic`, `owner-step`, `manual`, `parked`); the monitor
+  also pops any that reach the queue.
 - **A label or milestone**: `gh issue list --label X` / `--milestone X`.
 - **No args**: `gh issue list --state open --limit 20` and ask which to dispatch
   (AskUserQuestion, multiSelect).
