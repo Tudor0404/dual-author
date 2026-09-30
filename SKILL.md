@@ -564,8 +564,10 @@ printf '## Acceptance criteria — evidence\n\n| Criterion | Proving test | CI j
 gh issue comment "$N" --body-file "$BASE/issue-$N-accomment.md"
 ```
 
-Then mark the PR ready and merge per `config.toml [merge]` — with `auto = true` (default)
-it merges only once ALL checks pass; never merge with failing or pending checks yourself.
+Then mark the PR ready and merge per `config.toml [merge]` — with `auto = true` it merges
+only once ALL checks pass; never merge with failing or pending checks yourself. With
+`auto = false` (set on repos that have no branch protection, so arming always fails) merge
+directly on the strength of the review gate; see **When auto-merge cannot be armed** below.
 If `merge.enabled = false`, mark ready and STOP (a human merges):
 
 ```bash
@@ -584,11 +586,29 @@ After arming, wait (bounded, ~15 min) for the merge to actually land:
 dispatcher recycle your workspace for the next queued issue. If checks are still
 running at the deadline, report `auto-merge armed` instead and stop.
 
-If the repo doesn't allow auto-merge (`gh pr merge --auto` fails), verify checks
-directly instead: `gh pr checks "$PR" --watch` and merge with `gh pr merge "$PR"
---squash` only when every check is green; if checks fail, treat it as a new finding
-(fix → push → re-check, looping until clean). If anything still fails at the end,
-leave the PR draft and unmerged.
+**When auto-merge cannot be armed.** `gh pr merge --auto` fails on a repo with no
+branch protection: *"Auto-merge could not be armed because GitHub reports that
+protected branch rules are not configured."* Do NOT then fall back to
+`gh pr checks "$PR" --watch` — a repo without protection usually has no CI either, so
+that watches a set of zero checks and tells you nothing. Check first:
+
+```bash
+gh pr checks "$PR" 2>&1 | head -3   # "no checks reported" = there is no CI here
+```
+
+- **Checks exist** → watch them, and merge only when every one is green. A failing
+  check is a new finding: fix → push → re-review → re-check, looping until clean.
+- **No checks reported** → there is nothing for auto-merge to gate on, and the
+  dual-author gate IS the gate. Merge directly with
+  `gh pr merge "$PR" --squash --delete-branch`, on exactly the same authority you would
+  have armed auto-merge with: two fresh reviewer PASSes on the current full diff, plus
+  your own in-session suite green and its real counts in the PR body. Say in your report
+  that you merged directly because the repo reports no checks.
+
+Set `merge.auto = false` in that repo's config so no lane wastes a round on the arming
+attempt. Never treat "no checks reported" as permission to skip the review gate or the
+in-session suite — with no CI those two ARE the only gate, so they get stricter, not
+looser. If anything still fails at the end, leave the PR draft and unmerged.
 
 **Re-review invariant — no commit reaches the merge gate unreviewed.** ANY commit made
 after the last reviewer pass (a checks-fail fix, work following an escalation answer,
