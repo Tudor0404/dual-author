@@ -199,12 +199,12 @@ class DispatchGuardTest(unittest.TestCase):
         self.pick()
         self.assertEqual(len(fake.meta_calls("101")), 1)
 
-    def test_shipped_config_skips_epic_and_owner_step(self):
+    def test_shipped_config_skips_non_agent_labels(self):
         with open(os.path.join(ROOT, "config.toml")) as f:
             conf = monitor._toml_load(f.read())
-        self.assertEqual(conf["dispatch"]["skip_labels"], ["epic", "owner-step"])
+        self.assertEqual(conf["dispatch"]["skip_labels"], ["epic", "owner-step", "manual", "parked"])
         self.assertEqual(monitor.DEFAULTS["dispatch"]["skip_labels"],
-                         ["epic", "owner-step"])
+                         ["epic", "owner-step", "manual", "parked"])
 
 
 if __name__ == "__main__":
