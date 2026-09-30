@@ -1666,6 +1666,43 @@ def _recycle(issue, state):
                 else "♻ recycled (PR merged)", time.time())
 
 
+def _merged_pr_autocloses(issue):
+    """True when this lane's merged PR will close the issue BY ITSELF, shortly.
+
+    GitHub honours a closing keyword ("Closes #N", "fixes #N", ...) in a PR body only
+    on a merge into the DEFAULT branch, and it acts ASYNCHRONOUSLY — measured at ~50s
+    after the merge. `_requeue_if_still_open` reads issue state the instant recycle
+    fires, so it sees OPEN and requeues an issue that is about to close. The next tick
+    then cuts a phantom lane with no work in it: because that lane never opens a PR,
+    `pr_merged` never becomes true for it, recycle never fires, and its workspace sits
+    in a slot until someone removes it by hand.
+
+    Observed 2026-09-30: PR #1913 merged 13:06:08Z with "Closes #1818"; the requeue
+    check saw OPEN, `issue/1818-r2` was cut, and the issue closed seconds later. Same
+    sequence produced a phantom `issue/1855-r2`.
+
+    Reading the keyword is better than sleeping on a grace delay: it is synchronous,
+    and it distinguishes a PHASED issue ("Part of #N", which GitHub leaves open on
+    purpose and which genuinely needs requeuing) from a finishing one."""
+    info = pr_info(issue) or {}
+    num = info.get("number")
+    root = repo_root()
+    if not num or not root:
+        return False
+    # Off the default branch GitHub ignores the keyword entirely; _close_off_default
+    # owns that case, so a keyword there must NOT suppress the requeue.
+    if (info.get("base") or "") != default_branch(root):
+        return False
+    ok, body = _gh("pr", "view", str(num), "--repo", _repo(), "--json", "body",
+                   "-q", ".body")
+    if not ok or not body:
+        return False
+    kw = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+    n = re.escape(str(issue))
+    return bool(re.search(rf"\b{kw}\b\s*:?\s+(?:#|\S+#|\S+/issues/){n}\b",
+                          body, re.I))
+
+
 def _requeue_if_still_open(issue, state):
     """A merged PR does not mean the issue is finished.
 
@@ -1691,6 +1728,8 @@ def _requeue_if_still_open(issue, state):
                  "-q", ".state")
     if not ok or st.strip().lower() != "open":
         return False
+    if _merged_pr_autocloses(issue):
+        return False  # reads OPEN only because GitHub has not caught up yet
     n = str(issue)
     try:
         with open(queue_path()) as f:
