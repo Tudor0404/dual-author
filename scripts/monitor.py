@@ -1704,6 +1704,12 @@ def _requeue_if_still_open(issue, state):
             f.write(n + "\n")
     except OSError:
         return False
+    # _PR_CACHE holds a MERGED entry as TERMINAL and never re-polls it, so without
+    # this the next lane for the same issue reads the old PR as its own, recycles on
+    # its first tick and requeues again — one hot loop per tick. _free_lane_branch
+    # gives the new lane a branch with no merged PR, but only a LIVE poll sees that.
+    _PR_CACHE.pop(n, None)
+    _PR_CACHE.pop(str(issue), None)
     return True
 
 
