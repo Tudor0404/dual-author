@@ -1859,6 +1859,31 @@ def _merged_pr_autocloses(issue):
                           body, re.I))
 
 
+def _lane_has_nothing_left(issue):
+    """True when a lane has nothing left in flight: its issue is CLOSED and no PR of its
+    own is still OPEN (none at all, or one already merged/closed).
+
+    `recycle` keys on pr_merged, which is the right ground truth for the normal path but
+    misses a lane that correctly concluded there was no code to write. #2248 investigated
+    its failure, found it already fixed on main by #1919, closed the issue with that
+    evidence and never opened a PR — so pr_merged stayed false forever and the lane sat
+    on a slot for over two hours with the dashboard reporting phase "done".
+
+    The open-PR half of the test is load-bearing, NOT a formality: an issue closed by the
+    owner while its lane still has a PR in flight must be left alone to land that work.
+    That happened twice on 2026-09-30 (#1770 and #1803, both closed by hand mid-flight
+    with draft PRs worth merging), and tearing those lanes down would have thrown the
+    work away."""
+    repo = _repo()
+    if not repo:
+        return False
+    ok, st = _gh("issue", "view", str(issue), "--repo", repo, "--json", "state", "-q", ".state")
+    if not ok or st.strip().lower() == "open":
+        return False
+    info = pr_info(issue) or {}
+    return (info.get("state") or "").upper() not in ("OPEN",)
+
+
 def _requeue_if_still_open(issue, state):
     """A merged PR does not mean the issue is finished.
 
@@ -2173,8 +2198,8 @@ def lifecycle(state, rows):
             reg = load_registry()
             for r in rows:
                 n = str(r["issue"])
-                if n in reg and pr_merged(n):  # gh ground truth only
-                    _recycle(n, state)
+                if n in reg and (pr_merged(n) or _lane_has_nothing_left(n)):
+                    _recycle(n, state)  # gh ground truth only
         _drain_requeue_pending(state)
         if lc.get("dispatch"):
             cap = int(cfg()["dispatch"]["parallel"])
