@@ -22,7 +22,8 @@ Views
          per issue — implement → draft PR → review rounds → checks → merge
 
 Keys   ↑/↓ j/k select · Enter/f focus worker pane in herdr · g graph ·
-       o open PR · r poll now · p cycle poll interval (5/20/60s, persisted) ·
+       o open PR · i open the issue on GitHub (works on queued rows too) ·
+       r poll now · p cycle poll interval (5/20/60s, persisted) ·
        q quit (pipeline keeps running)
 """
 import json
@@ -387,6 +388,7 @@ class DualAuthorApp(App):
                 Binding("g", "graph", "graph"),
                 Binding("f,enter", "focus_worker", "focus pane", priority=True),
                 Binding("o", "open_pr", "open PR"),
+                Binding("i", "open_issue", "open issue"),
                 Binding("r", "poll", "poll"),
                 Binding("p", "cycle_poll", "interval"),
                 Binding("j", "cursor(1)", show=False),
@@ -535,6 +537,26 @@ class DualAuthorApp(App):
         i = self.sel_index(rows)
         return rows[i] if rows and i < len(rows) else None
 
+    def _selected_issue(self):
+        """The highlighted row's issue number — for QUEUED rows as well as active ones.
+
+        Read from the row KEY, not from self._rows, which holds only the active lanes:
+        a queued row's cursor index runs past the end of that list, which is why `o`
+        and `enter` do nothing once the cursor is down there. A queued issue is exactly
+        the one a viewer wants to open, to see what is still blocking it, so this takes
+        the key instead — `str(n)` for an active lane, `q<n>` for a queued one.
+        """
+        t = self.query_one(DataTable)
+        if not t.row_count:
+            return None
+        try:
+            key = t.ordered_rows[t.cursor_row].key.value
+        except (IndexError, AttributeError):
+            return None
+        if not key:
+            return None
+        return key[1:] if key.startswith("q") else key
+
     def action_focus_worker(self):
         r = self._selected_row()
         if not r or not r.get("pane_id"):
@@ -559,6 +581,22 @@ class DualAuthorApp(App):
         if url:
             self.run_worker(
                 lambda: subprocess.run(["open", url], capture_output=True), thread=True)
+
+    def action_open_issue(self):
+        n = self._selected_issue()
+        if not n:
+            return
+        # The snapshot's repo, NOT the M.ns() fallback the header uses: a namespace slug
+        # (dissei-org-case-foundry) is not an owner/name path, so falling back to it
+        # would open a plausible-looking wrong URL. Say so instead.
+        repo = self.collector.repo()
+        if not repo:
+            self.notify("no repo in the snapshot yet — can't build the issue URL",
+                        severity="warning", timeout=3)
+            return
+        url = f"https://github.com/{repo}/issues/{n}"
+        self.run_worker(
+            lambda: subprocess.run(["open", url], capture_output=True), thread=True)
 
     def action_poll(self):
         self.collector.poll_now()

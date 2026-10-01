@@ -316,7 +316,8 @@ activity feed of phase transitions, and a `[g]` graph view showing the blocking 
 across the run's issues (GitHub issue dependencies + "blocked by #N" body
 conventions, queued issues included) above every issue's full pipeline chain
 (implement → draft PR → review rounds → checks → merge).
-Keys: ↑↓/jk select · Enter/f focus the worker's pane · g graph · o open PR · r poll
+Keys: ↑↓/jk select · Enter/f focus the worker's pane · g graph · o open PR · i open
+issue · r poll
 · q quit (the pipeline keeps running). Without uv, or with `--legacy`, or when stdout
 isn't a TTY, it falls back to the plain-text render.
 
