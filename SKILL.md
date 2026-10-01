@@ -403,10 +403,27 @@ Wherever this role says `<base>`, substitute that branch name literally.
 Use `$BASE/...` for every temp path below. The review runner auto-namespaces its own
 output dirs and reviewer agent names, so `monitor.py review <N> ...` needs no ns flag.
 
-**Phase markers**: the dispatcher reads your pane to drive a live dashboard. At every
-transition, `echo "[dual-author] phase: <phase> ::"` — the trailing ` ::` sentinel lets
-the monitor parse the token exactly even when the TUI wraps adjacent text into it
-(without it, `review-round-1` + a wrapped timestamp parses as `review-round-12026`).
+**Phase markers**: the dispatcher reads these to drive a live dashboard. At every
+transition write the phase to a FILE, and echo it too:
+
+```bash
+PH=<phase>
+echo "$PH" > /tmp/dual-author/$(python3 $MONITOR ns)/issue-<N>-phase
+echo "[dual-author] phase: $PH ::"
+```
+
+The **file is what the monitor actually reads**; the echo is a fallback. Do not skip the
+file. An echo only reaches the monitor from a codex worker, whose output lands in plain
+terminal text — a claude worker's echo is a collapsed tool line that its TUI truncates
+and `herdr pane read` does not reproduce at all. That is not hypothetical: on 2026-10-01,
+three Opus-authored lanes had zero readable markers in their last 900 lines while all
+three were hours into review rounds, so every lane on the dashboard sat frozen at
+`starting` and looked stuck.
+
+The trailing ` ::` sentinel on the echo lets the monitor parse the token exactly even
+when the TUI wraps adjacent text into it (without it, `review-round-1` plus a wrapped
+timestamp parses as `review-round-12026`). Write ONE phase per line; the last line wins.
+
 Phases are SINGLE hyphenated tokens: `implementing`, `pushing-pr`, `review-round-<k>`,
 `fixing-round-<k>`, `awaiting-bots`, `blocked:<hyphenated-reason>`, `done`.
 

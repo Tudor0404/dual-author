@@ -961,9 +961,33 @@ def diff_stats(cwd):
         return None
 
 
+def _phase_from_file(issue):
+    """The phase a worker last RECORDED to its phase file, or None.
+
+    The pane-text marker (`echo "[dual-author] phase: X ::"`) only reaches the monitor
+    for a CODEX worker, whose echo lands in plain terminal output. A claude worker's
+    echo is a collapsed tool line that its TUI truncates, and `herdr pane read` does
+    not reproduce it: verified 2026-10-01 on three Opus-authored lanes — zero markers
+    in the last 900 lines while all three were hours into review rounds. Authoring moved
+    to Opus 5.5 the day before, which is exactly when every lane's phase froze at
+    "starting". A file is immune to how any agent TUI renders its tool calls."""
+    try:
+        with open(os.path.join(base(), f"issue-{issue}-phase")) as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    tok = PHASE_TOKEN_RE.match(re.sub(r"\s+", "", lines[-1]))
+    return tok.group(0) if tok else None
+
+
 def snapshot(issues):
     ag = agents()
     reg = load_registry()
+    # Read once, for the phase latch below: a marker that has scrolled out of the pane
+    # window must not look like a return to "starting".
+    prev = load_state()
     rows = []
     for n in issues:
         a = _worker_agent(ag, n, reg)
@@ -980,8 +1004,9 @@ def snapshot(issues):
         # phases are single hyphenated tokens; the agent TUI hard-wraps mid-word.
         # Prefer the " ::"-sentinel form (exact through wrapping); fall back to
         # stripping ALL whitespace from the window and keeping the leading token.
-        phases = []
-        for p in PHASE_SENT_RE.findall(text):
+        # The file is authoritative when present; pane text is the codex-era fallback.
+        phases = [] if _phase_from_file(n) is None else [_phase_from_file(n)]
+        for p in [] if phases else PHASE_SENT_RE.findall(text):
             tok = PHASE_TOKEN_RE.match(re.sub(r"\s+", "", p))
             if tok:
                 phases.append(tok.group(0))
@@ -990,7 +1015,21 @@ def snapshot(issues):
                 tok = PHASE_TOKEN_RE.match(re.sub(r"\s+", "", p))
                 if tok:
                     phases.append(tok.group(0))
-        phase = phases[-1] if phases else "starting"
+        if phases:
+            phase = phases[-1]
+        else:
+            # No marker in THIS window does not mean the lane went back to the start.
+            # The window is the last 120 lines of pane text and a worker emits a phase
+            # marker ONCE, on entry — so a dense transcript scrolls it out within
+            # minutes. Claude-authored lanes (the owner moved authoring to Opus 5.5 on
+            # 2026-09-30) are far denser than codex ones and lose it almost at once.
+            # Regressing to "starting" then made every lane read as stuck in its first
+            # phase for hours, and update_timing saw a phase CHANGE, so it logged a
+            # bogus "<phase> → starting" transition and reset phase_start — which also
+            # destroyed the "in phase" duration the dashboard shows.
+            # A phase marker is a latch: when the window no longer shows one, keep the
+            # last phase this issue was known to be in.
+            phase = (prev.get(str(n)) or {}).get("phase") or "starting"
         # completion = ANY of: verdict block in window, done phase marker, or the
         # PR-merge ground truth (pane text alone is lossy — scroll/limits/redraws)
         verdict = (f"=== ISSUE #{n} VERDICT ===" in text) or phase == "done" or pr_merged(n)
