@@ -16,22 +16,23 @@
 
 
 # ── who IMPLEMENTS each issue (the "main authoring") ─────────────────────────
-# Owner 2026-09-30: authoring moves to Opus 5.5. Reviewing is unchanged — codex
-# gpt-5.6-terra + claude claude-sonnet-5-5 (owner 2026-09-29).
+# Owner 2026-10-03: authoring moves to codex GPT-6 Astra at medium effort.
+# (Was Opus 5.5 from 2026-09-30; gpt-6-sol before that.) Reviewing is unchanged —
+# codex gpt-5.6-terra + claude claude-sonnet-5-5 (owner 2026-09-29).
+#
+# Verified before switching, because a model this account rejects kills every lane
+# at spawn rather than failing visibly:
+#   codex exec -m gpt-6-astra -c model_reasoning_effort='"medium"' '...'  -> answered
 [author]
-tool   = "claude"        # "claude" or "codex"
+tool   = "codex"         # "claude" or "codex"
+# The claude-only keys below are dormant while tool = "codex"; codex reads
+# codex_model / codex_effort instead. model/effort are kept distinct from the
+# codex_* pair so the two tools never collide on one key.
 model  = "claude-opus-5-5"
-# effort MUST stay empty, not absent: DEFAULTS carries "high", and `--effort high`
-# makes the installed claude CLI behind the teamclaude wrapper exit instantly
-# (verified — the same command without it answers). Removing the key here lets the
-# default through and every lane dies at spawn.
 effort = ""
-# launch_prefix REPLACES the binary (the wrapper implies claude). Bare `claude`
-# draws on THIS machine's own account, which is weekly-limited — it starts, prints
-# "You've hit your weekly limit" and sits on a dialog, reported as SPAWN-FAILED.
-# The pooled wrapper is the only route past that, and it is what the claude
-# reviewer slot has been using all along.
-launch_prefix = ["teamclaude", "run", "--auto-fallback", "--"]
+# launch_prefix REPLACES the binary and implies `claude`, so it must NOT be set
+# while tool = "codex" — it would launch claude with codex's arguments.
+# launch_prefix = ["teamclaude", "run", "--auto-fallback", "--"]
 # extra_args = ["--foo"] # appended verbatim to the launch argv (escape hatch)
 
 # codex-as-author needs to push, call gh, run dev tools — so it authors with a
@@ -50,7 +51,7 @@ codex_approval = "never"                # never | on-request | on-failure | untr
 # Re-probed 2026-09-07 (same login): gpt-6-astra is now listed ("Our most capable
 #   model for complex, demanding work", efforts low..ultra); 5.6 sol/luna/terra, 5.5,
 #   5.4-mini and 5.3-codex-spark still listed.
-codex_model    = "gpt-6-sol"          # owner's pick 2026-09-07 (run at medium effort)
+codex_model    = "gpt-6-astra"        # owner's pick 2026-10-03, at medium effort
 codex_effort   = "medium"               # reasoning effort: minimal | low | medium | high | xhigh | max | ultra
 
 
