@@ -1393,13 +1393,19 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
         # and do not run the whole suite.
         return (f"{prompt} Write your FULL review to {outfile}, ending the file "
                 f"with VERDICT: PASS or VERDICT: FAIL on its own line.\n\n"
-                f"BUDGET, and it is binding. Write {outfile} with a provisional "
-                f"VERDICT line as soon as you have your first finding, BEFORE any "
-                f"further verification, then rewrite it as you learn more. A review "
-                f"you did not write down does not exist: the file is the only "
-                f"contract, and a slot with no file is reported MISSING and your "
-                f"findings are discarded however good they were. Never leave it "
-                f"unwritten while you keep investigating.\n"
+                f"BUDGET, and it is binding. Write {outfile} as soon as you have "
+                f"your first finding, BEFORE any further verification, ending it "
+                f"with the exact line VERDICT: PENDING. Keep rewriting the file as "
+                f"you learn more, leaving VERDICT: PENDING in place, and replace that "
+                f"line with VERDICT: PASS or VERDICT: FAIL only when you have "
+                f"actually concluded. PENDING is NOT a verdict and does not end the "
+                f"round, so it is safe to write early and often; PASS or FAIL ends "
+                f"your slot immediately and closes your pane, so never write either "
+                f"one speculatively. A review you did not write down does not exist: "
+                f"the file is the only contract, and a slot with no file at the "
+                f"deadline is reported MISSING and your findings are discarded "
+                f"however good they were. Never leave it unwritten while you keep "
+                f"investigating.\n"
                 f"Do NOT run the full test suite. The author has already run it and "
                 f"its logs are in this review directory. Run at most the specific "
                 f"tests touching the behaviour you are questioning, and if you are "
@@ -1488,12 +1494,15 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                     pane = _agent_pane(p["name"])
                     if pane:
                         _run("herdr", "pane", "send-text", pane,
-                             f"Your review file {p['file']} is missing or lacks a final VERDICT line. Write it now, ending with VERDICT: PASS or VERDICT: FAIL.")
+                             f"Half your review window is gone and {p['file']} has no decided verdict yet. If it is unwritten, write it NOW with your findings so far ending in VERDICT: PENDING. If it already says PENDING, finish and replace that line with VERDICT: PASS or VERDICT: FAIL. An unfinished file still beats no file.")
                         _run("herdr", "pane", "send-keys", pane, "Enter")
             time.sleep(3)  # pace the file poll; the verdict file is checked every pass
         # Anyone still pending hit the deadline — nothing is cancelled any more, so
         # CANCELLED is no longer a reachable verdict. Callers still read it
-        # structurally for rounds recorded before 2026-10-07.
+        # structurally for rounds recorded before 2026-10-07. A slot that wrote
+        # findings but never concluded resolves as PENDING (from its own file), which
+        # is strictly better than the MISSING it used to produce: the author gets the
+        # findings, and PENDING is not a pass.
         for slot in pending:
             p = plan[slot]
             # Take whatever is on disk. No status wait, no second re-prompt — the

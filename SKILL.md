@@ -528,6 +528,15 @@ before that date.
 Fix against EVERY failing review, not the first one you read. If one reviewer passes
 and another fails, the FAIL decides the round.
 
+**`PENDING` and the write-early contract.** Reviewers are told to write their review
+file immediately, ending it with `VERDICT: PENDING`, and to replace that line with
+`PASS` or `FAIL` only once they have concluded. `PENDING` is deliberately not a
+verdict: it does not end the reviewer's slot, so a reviewer can record findings as it
+goes without cutting itself off. A slot that reaches the deadline still on `PENDING`
+is reported as `PENDING`, and that is NOT a pass: read its findings, address or rebut
+them, and run a fresh round. This exists because an unbounded reviewer used to hit
+the deadline with nothing written and have real findings discarded as `MISSING`.
+
 Then read the FULL reviews from the file paths in the JSON (the Read tool — not
 pane scrollback): read every slot that has a verdict. `MISSING`/`SPAWN-FAILED`
 after the runner's own retries is a real failure: re-run the round once with a fresh tag
