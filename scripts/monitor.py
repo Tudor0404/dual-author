@@ -404,6 +404,17 @@ def _build_argv(spec, role):
         argv = ["grok"]
         if spec.get("grok_approve", True):
             argv += ["--always-approve"]
+        if spec.get("grok_trust", True):
+            # FOLDER TRUST IS A SEPARATE GATE from --always-approve, and it is the
+            # one that actually stops a reviewer: grok opens on "Do you trust the
+            # contents of this directory?" and waits. Every lane is a fresh worktree,
+            # so every lane asks, and herdr reports the blocked agent as "idle" —
+            # which _agent_alive accepts as alive, so the slot never falls back to a
+            # claude substitute. It sits until the round's timeout and reports
+            # MISSING. --trust grants and records the folder in
+            # ~/.grok/trusted_folders.toml at launch. It is undocumented in --help
+            # on 1.0.46 but works (owner-approved 2026-10-07).
+            argv += ["--trust"]
         sandbox = spec.get("grok_sandbox")  # unset = grok's own default profile
         if sandbox:
             argv += ["--sandbox", sandbox]
