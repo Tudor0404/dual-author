@@ -515,17 +515,21 @@ element (immune to typing truncation), retries a failed spawn once, re-prompts o
 reviewer idles without writing its VERDICT, and closes both panes in a `finally` — no
 orphans even on crash/timeout.
 
-**Fail-fast short-circuit.** The two reviewers run concurrently and the runner polls
-both. The **first** reviewer to return `VERDICT: FAIL` ends the round immediately: the
-other reviewer is **cancelled** (its pane closed) and reported as `CANCELLED`. You do
-NOT wait for a second opinion on a round that already failed — read the failing
-reviewer's review file and go straight to fixing (step 3). A `CANCELLED` slot is
-expected and fine; it is not an error and needs no re-run. Both reviewers only run to
-completion when neither fails.
+**Every reviewer runs to its own conclusion.** The reviewers run concurrently and the
+runner polls all of them. A `VERDICT: FAIL` from one does **not** end the round: the
+others keep going and the round returns every verdict it collected. Changed 2026-10-07
+by owner decision, because the old fail-fast short-circuit silently reduced the panel
+to its fastest member — a grok reviewer was spawned five times across two lanes and
+produced zero verdicts, since codex reached FAIL first every round. Rounds that FAIL
+are exactly the rounds with the most to find, so a slower reviewer contributed nothing.
+`CANCELLED` is therefore no longer produced; you may still see it in rounds recorded
+before that date.
 
-Then read the FULL review(s) from the file path(s) in the JSON (the Read tool — not
-pane scrollback): on a FAIL short-circuit, read the failing slot's file (the
-`CANCELLED` slot has no usable verdict); otherwise read both. `MISSING`/`SPAWN-FAILED`
+Fix against EVERY failing review, not the first one you read. If one reviewer passes
+and another fails, the FAIL decides the round.
+
+Then read the FULL reviews from the file paths in the JSON (the Read tool — not
+pane scrollback): read every slot that has a verdict. `MISSING`/`SPAWN-FAILED`
 after the runner's own retries is a real failure: re-run the round once with a fresh tag
 (`r<k>b`); if it fails again, escalate (step 0).
 

@@ -40,10 +40,10 @@ Usage:
         worker pane), verify registration, name them <ns>-issue-<N>-{codex,claude}-
         <tag>, poll both to idle CONCURRENTLY, verify the review files end with a
         VERDICT line (one re-prompt if not), then ALWAYS close both panes (finally).
-        The first VERDICT: FAIL short-circuits the round: the other reviewer is
-        cancelled (verdict CANCELLED) so the failing feedback reaches the worker
-        immediately. Prints JSON {codex:{file,verdict}, claude:{file,verdict}} and
-        exits 0 (verdicts PASS/FAIL/CANCELLED). Reviews land in
+        EVERY reviewer runs to its own conclusion: a FAIL no longer cancels the
+        others (that reduced the panel to its fastest member — see review_round).
+        Prints JSON {codex:{file,verdict}, claude:{file,verdict}} and
+        exits 0 (verdicts PASS/FAIL/MISSING/SPAWN-FAILED). Reviews land in
         /tmp/dual-author/<ns>/issue-<issue>/<tag>-{codex,claude}.md.
         Prompts pass as a single argv element — immune to typing truncation.
 
@@ -1172,9 +1172,9 @@ def sweep_reviewers(state, ag):
 # ---------------- review-round state machine ----------------
 # States per reviewer: SPAWN -> VERIFY (retry once) -> RUN (working->idle) ->
 # COLLECT (re-prompt once if file lacks VERDICT) -> CLEAN (always).
-# RUN polls both reviewers concurrently: the first VERDICT: FAIL short-circuits the
-# round — the other reviewer is cancelled (CANCELLED) and the failing review goes
-# straight back to the worker (the author) to fix against.
+# RUN polls every reviewer concurrently and each one runs to its own conclusion; a
+# FAIL does not cancel the others. Every written review goes back to the worker (the
+# author) to fix against.
 
 def _run(*args, timeout=None):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -1415,12 +1415,20 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                              or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"]))
         # COLLECT helper: read a finished reviewer's verdict, re-prompt once if absent.
         # RUN — poll both reviewers CONCURRENTLY rather than waiting one out fully.
-        # The reviewers run in parallel; the moment ONE returns VERDICT: FAIL we
-        # cancel the other (close its pane) and return — the author has to fix
-        # against the failing review regardless, so a second opinion buys nothing
-        # and only costs wall-clock. The cancelled slot is reported as CANCELLED so
-        # the worker knows it was short-circuited, not broken. (PASS reviewers still
-        # both run to completion — we only short-circuit on the first FAIL.)
+        # The reviewers run in parallel and EVERY slot runs to its own conclusion.
+        #
+        # This used to short-circuit: the first VERDICT: FAIL cancelled the other
+        # reviewer, on the reasoning that the author must fix the failing review
+        # regardless, so a second opinion only costs wall-clock. In practice that
+        # silently reduced the panel to its fastest member. Measured 2026-10-07: a
+        # grok reviewer at xhigh was spawned five times across two lanes and produced
+        # ZERO verdicts, because codex reached FAIL first in every round and grok was
+        # cancelled each time. The rounds where a FAIL happens are exactly the rounds
+        # with the most to find, so the slower reviewer contributed nothing at all.
+        # A second reviewer that never speaks is not a panel. Owner decision
+        # (2026-10-07): collect both verdicts, and pay the wall-clock. The exposure
+        # is bounded by timeout_mins, and a FAIL still reaches the author as soon as
+        # the round ends.
         pending = []
         for slot, p in plan.items():
             if p["pane"]:
@@ -1430,8 +1438,7 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                 results[slot] = {"file": p["file"], "verdict": "SPAWN-FAILED", "tool": p["tool"]}
         deadline = time.time() + timeout_s
         nudge_at = time.time() + timeout_s // 2
-        failed = False
-        while pending and not failed and time.time() < deadline:
+        while pending and time.time() < deadline:
             for slot in list(pending):  # iterate a copy; we mutate pending below
                 p = plan[slot]
                 # THE FILE IS THE ONLY CONTRACT. Agent status is not a usable
@@ -1446,9 +1453,6 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                 if v_file in ("PASS", "FAIL"):
                     results[slot] = {"file": p["file"], "verdict": v_file, "tool": p["tool"]}
                     pending.remove(slot)
-                    if v_file == "FAIL":
-                        failed = True
-                        break
                     continue
                 # Nothing written yet. Nudge ONCE at the half-way mark in case the
                 # reviewer finished its analysis without writing the file, then keep
@@ -1462,21 +1466,16 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                              f"Your review file {p['file']} is missing or lacks a final VERDICT line. Write it now, ending with VERDICT: PASS or VERDICT: FAIL.")
                         _run("herdr", "pane", "send-keys", pane, "Enter")
             time.sleep(3)  # pace the file poll; the verdict file is checked every pass
-        # Resolve whoever is still pending: cancel them on a FAIL short-circuit,
-        # otherwise (deadline hit) collect whatever they managed to write.
+        # Anyone still pending hit the deadline — nothing is cancelled any more, so
+        # CANCELLED is no longer a reachable verdict. Callers still read it
+        # structurally for rounds recorded before 2026-10-07.
         for slot in pending:
             p = plan[slot]
-            if failed:
-                pane = _agent_pane(p["name"]) or p["pane"]
-                if pane:
-                    _run("herdr", "pane", "close", pane)
-                results[slot] = {"file": p["file"], "verdict": "CANCELLED", "tool": p["tool"]}
-            else:
-                # Deadline reached: take whatever is on disk. No status wait, no second
-                # re-prompt — the nudge already happened at the half-way mark.
-                results[slot] = {"file": p["file"],
-                                 "verdict": _verdict_of(p["file"]) or "MISSING",
-                                 "tool": p["tool"]}
+            # Take whatever is on disk. No status wait, no second re-prompt — the
+            # nudge already happened at the half-way mark.
+            results[slot] = {"file": p["file"],
+                             "verdict": _verdict_of(p["file"]) or "MISSING",
+                             "tool": p["tool"]}
     finally:  # CLEAN — unconditional, name-independent (uses tracked pane ids)
         for p in plan.values():
             pane = _agent_pane(p["name"]) or p["pane"]
