@@ -103,7 +103,11 @@ skip_labels = ["epic", "owner-step", "manual", "parked"]
 
 # ── the review panel ─────────────────────────────────────────────────────────
 [review]
-timeout_mins = 15        # per reviewer, per round
+# 25, not 15: with the FAIL short-circuit gone a reviewer runs to its own
+# conclusion, and a large diff at high effort does not reliably reach a written
+# verdict in 15 minutes. A MISSING slot discards real findings (issue #2629 lost a
+# grok review twice that way on 2026-10-07).
+timeout_mins = 25        # per reviewer, per round
 
 # Each [[review.reviewers]] is one reviewer. Order sets split placement
 # (right, down, right, …). Any mix/count of codex + claude + grok. A codex slot that

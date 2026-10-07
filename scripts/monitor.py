@@ -168,7 +168,11 @@ DEFAULTS = {
                  "dependency_fail_closed": False,
                  "skip_labels": ["epic", "owner-step", "manual", "parked"]},
     "review": {
-        "timeout_mins": 15,
+        # 15 was tight once a reviewer could no longer be short-circuited: a 69k diff
+        # at high reasoning effort does not reliably reach a written verdict inside
+        # it, and the slot resolves MISSING with its findings thrown away. Raised
+        # 2026-10-07 alongside the write-the-file-first budget in _mk_prompt.
+        "timeout_mins": 25,
         # The review panel. Order sets split placement (right, down, …). Each entry:
         # slot (stable id used in file/agent names), tool (codex|claude|grok), and
         # optional model/effort/extra_args (+ codex_sandbox/codex_approval, or
@@ -1379,8 +1383,29 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
                                                        "--auto-fallback", "--"]}))
 
     def _mk_prompt(outfile):
+        # The budget clauses are not boilerplate: they are the difference between a
+        # review and a MISSING slot. Measured 2026-10-07 on issue #2629, where a grok
+        # reviewer reproduced BOTH of the round's real bugs, then launched an
+        # unscoped full pytest run at its 47th tool call, spent ~162k tokens and hit
+        # the deadline having written nothing. Its findings were real and were lost
+        # entirely, twice (r4 and r4b), because the verdict file is the only contract
+        # and it never got written. So: write the file FIRST and keep it current,
+        # and do not run the whole suite.
         return (f"{prompt} Write your FULL review to {outfile}, ending the file "
-                f"with VERDICT: PASS or VERDICT: FAIL on its own line.")
+                f"with VERDICT: PASS or VERDICT: FAIL on its own line.\n\n"
+                f"BUDGET, and it is binding. Write {outfile} with a provisional "
+                f"VERDICT line as soon as you have your first finding, BEFORE any "
+                f"further verification, then rewrite it as you learn more. A review "
+                f"you did not write down does not exist: the file is the only "
+                f"contract, and a slot with no file is reported MISSING and your "
+                f"findings are discarded however good they were. Never leave it "
+                f"unwritten while you keep investigating.\n"
+                f"Do NOT run the full test suite. The author has already run it and "
+                f"its logs are in this review directory. Run at most the specific "
+                f"tests touching the behaviour you are questioning, and if you are "
+                f"unsure which those are, state the test you WOULD run in the review "
+                f"instead of running it. Reading code to reach a conclusion beats "
+                f"executing a suite to confirm it.")
 
     for i, rv in enumerate(reviewers):
         slot = str(rv.get("slot") or rv.get("tool") or f"r{i}")
