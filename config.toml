@@ -16,13 +16,14 @@
 
 
 # ── who IMPLEMENTS each issue (the "main authoring") ─────────────────────────
-# Owner 2026-10-03: authoring moves to codex GPT-6 Astra at medium effort.
-# (Was Opus 5.5 from 2026-09-30; gpt-6-sol before that.) Reviewing is unchanged —
-# codex gpt-5.6-terra + claude claude-sonnet-5-5 (owner 2026-09-29).
+# Owner 2026-10-07: authoring moves to codex GPT-6.1 Sol at xhigh effort, and the
+# review panel to codex gpt-6.1-sol (medium) + grok-4.7 (xhigh).
+# (Author was gpt-6-astra/medium from 2026-10-03, Opus 5.5 from 2026-09-30.)
 #
 # Verified before switching, because a model this account rejects kills every lane
 # at spawn rather than failing visibly:
-#   codex exec -m gpt-6-astra -c model_reasoning_effort='"medium"' '...'  -> answered
+#   codex debug models  -> gpt-6.1-sol listed, efforts low,medium,high,xhigh,max,ultra
+#   grok -p 'reply with just: OK' -m grok-4.7 --effort xhigh  -> answered
 [author]
 tool   = "codex"         # "claude" or "codex"
 # The claude-only keys below are dormant while tool = "codex"; codex reads
@@ -51,8 +52,9 @@ codex_approval = "never"                # never | on-request | on-failure | untr
 # Re-probed 2026-09-07 (same login): gpt-6-astra is now listed ("Our most capable
 #   model for complex, demanding work", efforts low..ultra); 5.6 sol/luna/terra, 5.5,
 #   5.4-mini and 5.3-codex-spark still listed.
-codex_model    = "gpt-6-astra"        # owner's pick 2026-10-03, at medium effort
-codex_effort   = "medium"               # reasoning effort: minimal | low | medium | high | xhigh | max | ultra
+# Re-probed 2026-10-07: gpt-6.1-sol is listed (efforts low..ultra).
+codex_model    = "gpt-6.1-sol"          # owner's pick 2026-10-07, at xhigh effort
+codex_effort   = "xhigh"                # reasoning effort: minimal | low | medium | high | xhigh | max | ultra
 
 
 # ── how many issues run at once ──────────────────────────────────────────────
@@ -104,30 +106,41 @@ skip_labels = ["epic", "owner-step", "manual", "parked"]
 timeout_mins = 15        # per reviewer, per round
 
 # Each [[review.reviewers]] is one reviewer. Order sets split placement
-# (right, down, right, …). Any mix/count of codex + claude. A codex slot that is
-# forced down (codex-down sentinel) or fails to spawn is auto-substituted with a
+# (right, down, right, …). Any mix/count of codex + claude + grok. A codex slot that
+# is forced down (codex-down sentinel) or fails to spawn is auto-substituted with a
 # fresh claude for that round, so a round is always decided.
+#
+# Owner 2026-10-07: the panel is codex gpt-6.1-sol (medium) + grok-4.7 (xhigh); the
+# claude reviewer is retired. The codex-down substitute is still claude, from
+# monitor.py's built-in spec (which carries the teamclaude prefix), not from here.
 [[review.reviewers]]
 slot           = "codex"          # stable id used in file/agent names
 tool           = "codex"
-model          = "gpt-5.6-terra"  # 5.6 mid tier ("Balanced agentic coding model" per
-                                  # `codex debug models`; sol=frontier, luna=fast/cheap)
-codex_effort   = "high"
+codex_model    = "gpt-6.1-sol"
+codex_effort   = "medium"
 codex_sandbox  = "workspace-write"
 codex_approval = "never"
 
+# `grok models` on this login lists ONLY grok-4.7, grok-4.7-build-fast, grok-4.6,
+# grok-4.5 — there is no 500k-context slug to pick, so the window is whatever
+# grok-4.7 serves. --reasoning-effort is a free-form string at the CLI, so an unknown
+# value kills the slot at spawn; "xhigh" verified 2026-10-07 with
+#   grok -p 'reply with just: OK' -m grok-4.7 --effort xhigh   -> answered
 [[review.reviewers]]
-slot          = "claude"
-tool          = "claude"
-model         = "sonnet"                 # opus while its weekly cap has headroom; sonnet is the safe default
-launch_prefix = ["teamclaude", "run", "--auto-fallback", "--"]
+slot        = "grok"
+tool        = "grok"
+grok_model  = "grok-4.7"
+grok_effort = "xhigh"
+# grok_sandbox = "..."   # unset = grok's own default profile
+# grok_approve = false   # drops --always-approve (the reviewer will then stall on
+                         # its first tool dialog — only for debugging)
 
-# Example — a third reviewer, or an all-claude panel (comment out the codex one):
+# Example — a third reviewer, or an all-claude panel (comment out the others):
 # [[review.reviewers]]
 # slot = "claude2"
 # tool = "claude"
 # model = "opus"
-# effort = "high"
+# launch_prefix = ["teamclaude", "run", "--auto-fallback", "--"]
 
 
 # ── what happens to a clean PR (WORKER step 4) ───────────────────────────────

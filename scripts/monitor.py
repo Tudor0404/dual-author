@@ -140,7 +140,7 @@ def sh(*args):
 
 # ---- configuration ---------------------------------------------------------
 # Everything a user is likely to want to change — which agent AUTHORS each issue
-# (claude OR codex), the review panel (any mix of codex/claude, models, effort),
+# (claude OR codex OR grok), the review panel (any mix of the three, models, effort),
 # concurrency, merge policy, and the monitor tunables — is read from a TOML file.
 # No tomllib on Python 3.9 (macOS system python), so a tiny dependency-free parser
 # handles the subset the config uses. Precedence (low → high, later wins):
@@ -170,8 +170,9 @@ DEFAULTS = {
     "review": {
         "timeout_mins": 15,
         # The review panel. Order sets split placement (right, down, …). Each entry:
-        # slot (stable id used in file/agent names), tool (codex|claude), and
-        # optional model/effort/extra_args (+ codex_sandbox/codex_approval).
+        # slot (stable id used in file/agent names), tool (codex|claude|grok), and
+        # optional model/effort/extra_args (+ codex_sandbox/codex_approval, or
+        # grok_model/grok_effort/grok_sandbox).
         "reviewers": [
             {"slot": "codex", "tool": "codex", "model": "", "effort": "",
              "codex_sandbox": "workspace-write", "codex_approval": "never",
@@ -390,6 +391,31 @@ def _build_argv(spec, role):
         # codex_model is the codex-only model slug — kept distinct from `model` (the
         # claude model) so the two tools don't collide on one shared key.
         model = spec.get("codex_model") or spec.get("model")
+        if model:
+            argv += ["-m", model]
+        return argv + extra
+    if tool == "grok":
+        # grok runs as an interactive TUI in a pane like claude/codex (herdr knows
+        # kind=grok), and takes its prompt as a positional arg, so the launch script
+        # needs no typing. --always-approve is the only non-interactive permission
+        # switch: without it the reviewer stalls on its first tool-use dialog and the
+        # round reads as a timeout. Left on by default for the same reason codex
+        # reviewers pass --ask-for-approval never.
+        argv = ["grok"]
+        if spec.get("grok_approve", True):
+            argv += ["--always-approve"]
+        sandbox = spec.get("grok_sandbox")  # unset = grok's own default profile
+        if sandbox:
+            argv += ["--sandbox", sandbox]
+        # --reasoning-effort is a free-form string at the CLI (low|medium|high|xhigh
+        # for grok-4.7); an unknown value is rejected at startup, which kills the
+        # slot, so verify a new one with `grok -p ok --effort <v>` before setting it.
+        effort = spec.get("grok_effort") or spec.get("effort")
+        if effort:
+            argv += ["--effort", effort]
+        # grok_model mirrors codex_model: tool-scoped so the three tools don't collide
+        # on one shared `model` key. `grok models` lists what this account can use.
+        model = spec.get("grok_model") or spec.get("model")
         if model:
             argv += ["-m", model]
         return argv + extra
@@ -1332,8 +1358,14 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
     # still yields a decided dual (or N-) reviewer verdict.
     reviewers = cfg()["review"]["reviewers"]
     splits = ["right", "down"]
+    # The hardcoded fallback carries launch_prefix because a BARE `claude` on this
+    # machine hits its own weekly limit and sits on a dialog (reported SPAWN-FAILED);
+    # it only applies when the roster has no claude reviewer to copy, which is now
+    # the normal case.
     claude_sub = copy.deepcopy(next((r for r in reviewers if r.get("tool") == "claude"),
-                                    {"tool": "claude", "model": "sonnet", "effort": "high"}))
+                                    {"tool": "claude", "model": "sonnet",
+                                     "launch_prefix": ["teamclaude", "run",
+                                                       "--auto-fallback", "--"]}))
 
     def _mk_prompt(outfile):
         return (f"{prompt} Write your FULL review to {outfile}, ending the file "
@@ -1355,13 +1387,14 @@ def review_round(issue, tag, prompt, cwd, timeout_s):
         for slot, p in plan.items():  # SPAWN + VERIFY (one retry)
             p["pane"] = (_spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"])
                          or _spawn_reviewer(p["name"], base_pane, p["split"], cwd, p["spec"], p["prompt"]))
-            # Self-healing codex fallback: if a codex reviewer can't start (quota
-            # dead, or it lost the auth-lock race after both retries) substitute a
-            # fresh claude into the slot for THIS round, so we still get a full panel
-            # and a DECIDED round instead of an undecided SPAWN-FAILED slot. No
-            # sentinel needed — codex is attempted from scratch next round, so the
-            # moment it recovers it's used again automatically.
-            if p["pane"] is None and p["tool"] == "codex":
+            # Self-healing fallback for ANY non-claude slot: if the reviewer can't
+            # start (codex quota dead or it lost the auth-lock race after both
+            # retries; a grok login expired) substitute a fresh claude into the slot
+            # for THIS round, so we still get a full panel and a DECIDED round
+            # instead of an undecided SPAWN-FAILED slot. No sentinel needed — the
+            # configured tool is attempted from scratch next round, so the moment it
+            # recovers it's used again automatically.
+            if p["pane"] is None and p["tool"] != "claude":
                 p["spec"] = copy.deepcopy(claude_sub)
                 p["tool"] = "claude"
                 p["name"] = f"{worker}-{slot}-{tag}x"
