@@ -528,6 +528,20 @@ before that date.
 Fix against EVERY failing review, not the first one you read. If one reviewer passes
 and another fails, the FAIL decides the round.
 
+**Only a P1 blocks** (owner decision 2026-10-08). A reviewer reports every finding in
+full, but ends with `VERDICT: PASS` when no P1 remains: no correctness, data-loss,
+identity or security defect, and no missed acceptance criterion. When a round passes
+with P2/P3 findings outstanding, **you must file each one as a follow-up issue against
+the merged code before you merge**, linking the PR, and list them in the PR body. A
+P2 that is never filed is worse than one that blocked, because it disappears. Several
+P2s on this repo turned out to be masked coverage gaps, so treat the follow-ups as
+real work, not as a formality.
+
+**Reviewers review incrementally after round 1**: the delta since the previous round
+plus verification that the last round's findings are fixed, then one full-diff pass
+before any PASS. Do not take a PASS on an incremental round as a full-diff review
+unless the reviewer says it did that final pass.
+
 **`PENDING` and the write-early contract.** Reviewers are told to write their review
 file immediately, ending it with `VERDICT: PENDING`, and to replace that line with
 `PASS` or `FAIL` only once they have concluded. `PENDING` is deliberately not a
